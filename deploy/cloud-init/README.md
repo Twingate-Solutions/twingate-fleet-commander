@@ -6,14 +6,14 @@ which is the single source of truth for standing up the stack:
 
 1. Install git + curl.
 2. Clone (or copy) this repository to `/opt/fleet-commander`.
-3. Run `deploy/bootstrap.sh` non-interactively, feeding it the Twingate network,
-   API key, and seed Remote Network id via environment variables.
+3. Run `deploy/bootstrap.sh` non-interactively, feeding it the Twingate network
+   and API key via environment variables.
 
 Because `bootstrap.sh` is idempotent, re-running any of these is safe.
 
 ## Before you boot
 
-Provide three values to first boot (how you inject them differs per platform —
+Provide two values to first boot (how you inject them differs per platform —
 see each file). **Treat `TWINGATE_API_KEY` as a secret**: prefer your cloud's
 secret store (AWS Secrets Manager / SSM, Azure Key Vault, GCP Secret Manager)
 over inlining it in user-data, which is often readable from instance metadata.
@@ -21,11 +21,11 @@ over inlining it in user-data, which is often readable from instance metadata.
 | Variable | Meaning |
 |---|---|
 | `TWINGATE_NETWORK` | network slug for `https://<slug>.twingate.com` |
-| `TWINGATE_API_KEY` | Admin/DevOps API key (used to mint seed connector tokens) |
-| `SEED_RN_ID` | Remote Network id the seed connectors join |
+| `TWINGATE_API_KEY` | Admin/DevOps API key (FC uses it to create/delete connectors) |
 
-Set `FC_SKIP_SEED=1` if you'd rather let FC provision the fleet up to the floor
-itself instead of starting seed connectors from compose.
+FC **self-provisions** its Connectors — there are no seed connectors. Set the
+Remote Network FC manages in `config/config.yaml` (`remote_network_id`); it is
+not a boot-time variable.
 
 | File | Platform | How values are passed |
 |---|---|---|

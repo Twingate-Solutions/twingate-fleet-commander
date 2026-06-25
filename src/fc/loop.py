@@ -8,8 +8,9 @@ signals → decision → action correlate), then:
    enrich them with Twingate liveness state by joining on connector id / name;
 #. **collect** — run every enabled collector per Connector, isolating failures
    so one bad Connector never aborts the cycle;
-#. **decide** — per Remote Network, ask the pure decider for a
-   :class:`~fc.models.ScaleDecision` and any :class:`~fc.models.HealthAction`s;
+#. **decide** — for the single managed Remote Network (Key Design Rule N1), ask
+   the pure decider for a :class:`~fc.models.ScaleDecision` and any
+   :class:`~fc.models.HealthAction`s;
 #. **act** — execute the three-step provision / drain-before-delete deprovision
    / restart-before-replace sequences, recording each in state and metrics.
 
@@ -35,14 +36,14 @@ from uuid import uuid4
 
 import structlog
 
-from fc.actuator.base import Actuator
-from fc.actuator.docker_actuator import DockerActuatorError
+from fc.actuator.base import Actuator, ActuatorError
 from fc.collectors.base import Collector, CollectorError
-from fc.config import Policy, ResolvedRemoteNetwork
+from fc.config import Policy
 from fc.engine.aggregator import Aggregator
-from fc.engine.decider import decide_health, decide_scale
+from fc.engine.decider import decide_health, decide_scale, is_unhealthy
 from fc.models import (
     ActionRecord,
+    ConnectorState,
     HealthAction,
     ManagedConnector,
     ResourceSample,
@@ -50,7 +51,7 @@ from fc.models import (
     ScaleDirection,
 )
 from fc.observability import events
-from fc.observability.metrics import Metrics
+from fc.observability.metrics import Metrics, classify_health_reason
 from fc.state import Cooldowns, StateStore
 from fc.status import ConnectorStatus, FleetSnapshot, RemoteNetworkStatus, StatusState
 from fc.twingate.client import TwingateApiError, TwingateClient
@@ -61,6 +62,24 @@ logger = structlog.get_logger(__name__)
 def _default_name_factory(rn_id: str) -> str:
     """Generate a unique container/Connector name for a new Connector in an RN."""
     return f"fc-{uuid4().hex[:12]}"
+
+
+@dataclass
+class _PendingReplace:
+    """A net-new replacement awaiting health before the old Connector is torn down.
+
+    Tracks the in-flight wait-for-healthy replace (Key Design Rule #4): the
+    replacement has been provisioned; the unhealthy ``old`` Connector is drained
+    and deleted only once ``new_connector_id`` reports ALIVE/healthy on a later
+    cycle. ``started_at`` bounds the wait via ``replace_health_timeout_seconds``.
+    ``reason`` is the decider's remediation reason, carried so the eventual
+    ``action.replace`` line can report why the replace was started.
+    """
+
+    new_connector_id: str
+    started_at: datetime
+    reason: str
+    actor: str = "auto"
 
 
 @dataclass
@@ -109,17 +128,17 @@ class ControlLoop:
         """Build the control loop.
 
         Args:
-            policy: The validated autoscaling policy (per-RN resolution lives
-                here).
+            policy: The validated autoscaling policy for the single managed
+                Remote Network.
             twingate: The Twingate Admin API client.
             actuator: The compute actuator (Docker, by default).
             collectors: The enabled collectors, run in order per Connector.
-            aggregator: The per-RN sliding-window aggregator.
+            aggregator: The sliding-window aggregator.
             state: The SQLite cooldown / action-history store.
             metrics: The manager self-metrics.
             clock: Returns "now"; defaults to UTC wall clock. Injectable for
                 deterministic tests.
-            name_factory: Maps an RN id to a fresh Connector name.
+            name_factory: Maps the RN id to a fresh Connector name.
             id_factory: Returns a cycle id; defaults to a random uuid hex.
             sleep: Async sleep used for the drain grace; injectable so tests
                 need not wait real seconds.
@@ -150,6 +169,18 @@ class ControlLoop:
         # manager restart it simply re-grace once, which is harmless because
         # already-healthy Connectors report ALIVE and are not remediated anyway.
         self._first_seen: dict[str, datetime] = {}
+        # Connector id → the time it first went (and has stayed) unhealthy.
+        # Drives the decider's unhealthy-duration gate so a brief blip never
+        # triggers remediation; the entry is cleared the moment the Connector
+        # recovers. In-memory like ``_first_seen``.
+        self._first_unhealthy: dict[str, datetime] = {}
+        # Old connector id → its in-flight wait-for-healthy replacement. Set when
+        # a replace begins (replacement provisioned) and cleared once the old
+        # Connector is torn down after the replacement is healthy (Key Design
+        # Rule #4). Cycle-spanning; in-memory (a restart forgets in-flight
+        # replaces, which self-heals as the still-unhealthy old Connector is
+        # re-evaluated next cycle).
+        self._pending_replaces: dict[str, _PendingReplace] = {}
 
     # -- public entry points -------------------------------------------------
 
@@ -190,49 +221,52 @@ class ControlLoop:
             async with self._action_lock:
                 fleet = await self._discover(log)
                 self._update_first_seen(fleet, now)
+                self._update_first_unhealthy(fleet, now)
                 samples = await self._collect(fleet, log)
                 self._aggregator.ingest(samples)
                 self._aggregator.prune(now=now)
                 result.sample_count = len(samples)
+                # The last sample seen per connector this cycle — threaded into
+                # the health-action logs so a restart/replace line carries the
+                # triggering signal alongside the decider's reason.
+                latest_by_connector: dict[str, ResourceSample] = {}
+                for sample in samples:
+                    latest_by_connector[sample.connector_id] = sample
 
-                by_rn = self._group_by_rn(fleet)
-                # Evaluate every explicitly-configured Remote Network even when
-                # it currently has zero discovered Connectors, so floor-fill can
-                # provision a baseline fleet from empty (the "start only the
-                # manager and it self-provisions" path). Discovered-but-unconfig-
-                # ured RNs are still handled; configured ones are just guaranteed
-                # a turn.
-                for override in self._policy.remote_networks:
-                    by_rn.setdefault(override.id, [])
-                result.rn_count = len(by_rn)
-                resolved_by_rn: dict[str, ResolvedRemoteNetwork] = {}
-                for rn_id, connectors in by_rn.items():
-                    resolved = self._policy.resolve_remote_network(rn_id)
-                    resolved_by_rn[rn_id] = resolved
-                    # Per-RN isolation: a failure deciding/acting on one Remote
-                    # Network (e.g. a sqlite hiccup reading cooldowns) is logged
-                    # and skipped so the remaining RNs — and the heartbeat,
-                    # gauges, and snapshot below — still complete this cycle.
-                    try:
-                        decision = await self._decide_scale(resolved, connectors, now, log)
-                        result.decisions.append(decision)
-                        await self._act_scale(decision, resolved, connectors, now, log)
+                # FC manages exactly one Remote Network (Key Design Rule N1).
+                # Its Connectors are always evaluated — even when none are
+                # discovered yet — so floor-fill can provision a baseline fleet
+                # from empty (the "start only the manager and it self-provisions"
+                # path).
+                rn_id = self._policy.remote_network_id
+                connectors = [c for c in fleet if c.rn_id == rn_id]
+                result.rn_count = 1
+                # Isolate a failure deciding/acting on the Remote Network (e.g. a
+                # sqlite hiccup reading cooldowns) so the heartbeat, gauges, and
+                # snapshot below still complete this cycle.
+                try:
+                    decision = await self._decide_scale(connectors, now, log)
+                    result.decisions.append(decision)
+                    await self._act_scale(decision, connectors, now, log)
 
-                        health = await self._decide_and_log_health(resolved, connectors, now, log)
-                        result.health_actions.extend(health)
-                        await self._act_health(health, connectors, resolved, now, log)
-                    except Exception as exc:
-                        log.error(
-                            events.LOOP_RN_ERROR,
-                            rn_id=rn_id,
-                            error=type(exc).__name__,
-                            detail=str(exc),
-                        )
-                        continue
+                    # Advance any in-flight wait-for-healthy replaces first, so a
+                    # completed replacement's old Connector is torn down and the
+                    # set of mid-replace ids excludes them from new decisions.
+                    await self._process_pending_replaces(connectors, now, log)
+                    health = await self._decide_and_log_health(connectors, now, log)
+                    result.health_actions.extend(health)
+                    await self._act_health(health, connectors, latest_by_connector, now, log)
+                except Exception as exc:
+                    log.error(
+                        events.LOOP_RN_ERROR,
+                        rn_id=rn_id,
+                        error=type(exc).__name__,
+                        detail=str(exc),
+                    )
 
                 self._metrics.set_fleet_gauges(fleet)
                 self._metrics.last_successful_cycle.set(now.timestamp())
-                self._publish_snapshot(cycle_id, now, by_rn, resolved_by_rn, samples)
+                self._publish_snapshot(cycle_id, now, connectors, samples)
             result.duration_ms = (time.monotonic() - started) * 1000.0
             log.info(
                 events.LOOP_CYCLE_COMPLETE,
@@ -258,13 +292,14 @@ class ControlLoop:
         cycle.
 
         Raises:
-            DockerActuatorError | TwingateApiError: Propagated to abort the
+            ActuatorError | TwingateApiError: Propagated to abort the
                 cycle (logged as ``loop.cycle.error``); the relevant error
                 counter is incremented first.
         """
+        log.debug(events.DISCOVER_START)
         try:
             containers = await self._actuator.list_managed()
-        except DockerActuatorError:
+        except ActuatorError:
             self._metrics.docker_api_errors.inc()
             raise
         try:
@@ -299,6 +334,7 @@ class ControlLoop:
         for connector in fleet:
             counts[connector.rn_id] = counts.get(connector.rn_id, 0) + 1
         log.info(events.DISCOVER_RESULT, fleet_size=len(fleet), per_rn=counts)
+        log.debug(events.DISCOVER_COMPLETE, fleet_size=len(fleet))
         return fleet
 
     # -- ② collect -----------------------------------------------------------
@@ -314,6 +350,7 @@ class ControlLoop:
         rest. A collector returning ``None`` (no sample this cycle) is simply
         omitted.
         """
+        log.debug(events.COLLECT_START)
         samples: list[ResourceSample] = []
         for connector in fleet:
             for collector in self._collectors:
@@ -335,6 +372,7 @@ class ControlLoop:
                         connector_id=connector.connector_id,
                         source=collector.source.value,
                     )
+        log.debug(events.COLLECT_COMPLETE, sample_count=len(samples))
         return samples
 
     # -- ③ decide ------------------------------------------------------------
@@ -352,42 +390,81 @@ class ControlLoop:
         for connector_id in self._first_seen.keys() - present:
             del self._first_seen[connector_id]
 
-    @staticmethod
-    def _group_by_rn(fleet: list[ManagedConnector]) -> dict[str, list[ManagedConnector]]:
-        """Group discovered Connectors by Remote Network id (skipping unknown RN)."""
-        groups: dict[str, list[ManagedConnector]] = {}
+    def _update_first_unhealthy(self, fleet: list[ManagedConnector], now: datetime) -> None:
+        """Track each Connector's continuous-unhealth start; reset on recovery.
+
+        A Connector that is unhealthy this cycle keeps (or gets) its first-
+        unhealthy timestamp; one that is healthy — or has departed the fleet —
+        has its timestamp cleared so its unhealthy-duration timer restarts from
+        scratch next time it goes unhealthy. This mirrors the decider's
+        :func:`~fc.engine.decider.is_unhealthy` predicate exactly so the gate and
+        the tracking never disagree.
+        """
+        present = {c.connector_id for c in fleet}
         for connector in fleet:
-            if not connector.rn_id:
-                continue
-            groups.setdefault(connector.rn_id, []).append(connector)
-        return groups
+            if is_unhealthy(connector):
+                self._first_unhealthy.setdefault(connector.connector_id, now)
+            else:
+                self._first_unhealthy.pop(connector.connector_id, None)
+        for connector_id in self._first_unhealthy.keys() - present:
+            del self._first_unhealthy[connector_id]
 
     async def _decide_scale(
         self,
-        resolved: ResolvedRemoteNetwork,
         connectors: list[ManagedConnector],
         now: datetime,
         log: structlog.BoundLogger,
     ) -> ScaleDecision:
-        """Compute the scale decision for one Remote Network and log it."""
+        """Reduce each scale metric over its own window and decide; then log."""
+        log.debug(events.DECIDE_START)
         ids = [c.connector_id for c in connectors]
-        up = self._aggregator.window_aggregate(
-            ids, window_seconds=resolved.scale_up_window_seconds, now=now
+        rn_id = self._policy.remote_network_id
+        metrics = self._policy.scale_metrics
+        cpu_value = self._aggregator.reduce(
+            ids,
+            signal="cpu",
+            window_seconds=metrics.cpu.window_seconds,
+            agg=metrics.cpu.agg,
+            now=now,
         )
-        down = self._aggregator.window_aggregate(
-            ids, window_seconds=resolved.scale_down_window_seconds, now=now
+        throughput_value = self._aggregator.reduce(
+            ids,
+            signal="throughput",
+            window_seconds=metrics.throughput.window_seconds,
+            agg=metrics.throughput.agg,
+            now=now,
         )
-        cooldowns = await self._state.get_cooldowns(resolved.id)
-        self._set_action_age_gauge(resolved.id, cooldowns, now)
+        # Per-connector windowed values feed the sticky-connector scale-up
+        # trigger (``any``/``quorum``); the fleet means above still drive the
+        # ``mean`` mode and the scale-down path.
+        cpu_by = self._aggregator.reduce_per_connector(
+            ids,
+            signal="cpu",
+            window_seconds=metrics.cpu.window_seconds,
+            agg=metrics.cpu.agg,
+            now=now,
+        )
+        tput_by = self._aggregator.reduce_per_connector(
+            ids,
+            signal="throughput",
+            window_seconds=metrics.throughput.window_seconds,
+            agg=metrics.throughput.agg,
+            now=now,
+        )
+        cooldowns = await self._state.get_cooldowns(rn_id)
+        self._set_action_age_gauge(rn_id, cooldowns, now)
         decision = decide_scale(
-            policy=resolved,
-            up=up,
-            down=down,
+            policy=self._policy,
+            cpu_value=cpu_value,
+            throughput_value=throughput_value,
             current_count=len(connectors),
             cooldowns=cooldowns,
             now=now,
+            cpu_by_connector=cpu_by,
+            throughput_by_connector_bps=tput_by,
         )
         self._log_decision(decision, log)
+        log.debug(events.DECIDE_COMPLETE, direction=decision.direction.value)
         return decision
 
     def _set_action_age_gauge(self, rn_id: str, cooldowns: Cooldowns, now: datetime) -> None:
@@ -429,21 +506,28 @@ class ControlLoop:
                 rn_id=decision.rn_id,
                 seconds_remaining=decision.metrics["cooldown_seconds_remaining"],
                 reason=decision.reason,
+                metrics=decision.metrics,
             )
         else:
-            log.info(events.DECIDE_NO_ACTION, rn_id=decision.rn_id, reason=decision.reason)
+            log.info(
+                events.DECIDE_NO_ACTION,
+                rn_id=decision.rn_id,
+                reason=decision.reason,
+                metrics=decision.metrics,
+            )
 
     async def _decide_and_log_health(
         self,
-        resolved: ResolvedRemoteNetwork,
         connectors: list[ManagedConnector],
         now: datetime,
         log: structlog.BoundLogger,
     ) -> list[HealthAction]:
-        """Compute health actions for an RN, logging dead/unhealthy/janus state."""
+        """Compute health actions for the RN, logging dead/unhealthy state."""
+        log.debug(events.HEALTH_START)
         for connector in connectors:
-            if connector.janus_locked:
-                log.info(events.JANUS_LOCK_ENGAGED, connector_id=connector.connector_id)
+            if connector.cordoned:
+                # Cordon = operator hand-off; FC will not remediate it, so don't
+                # emit a dead/unhealthy WARNING implying an action is coming.
                 continue
             if connector.twingate_state is not None and connector.twingate_state.value.startswith(
                 "DEAD"
@@ -454,70 +538,76 @@ class ControlLoop:
                     state=connector.twingate_state.value,
                 )
             elif connector.docker_health == "unhealthy":
-                log.warning(events.HEALTH_UNHEALTHY, connector_id=connector.connector_id)
+                log.warning(
+                    events.HEALTH_UNHEALTHY,
+                    connector_id=connector.connector_id,
+                    failing_streak=connector.docker_failing_streak,
+                )
 
-        window_start = now - timedelta(seconds=resolved.restart_window_seconds)
+        window_start = now - timedelta(seconds=self._policy.restart_window_seconds)
         restart_counts: dict[str, int] = {}
         for connector in connectors:
-            if connector.janus_locked:
+            if connector.cordoned:
                 continue
             restart_counts[connector.connector_id] = await self._state.count_recent_restarts(
                 connector.connector_id, since=window_start
             )
-        return decide_health(
-            policy=resolved,
+        actions = decide_health(
+            policy=self._policy,
             connectors=connectors,
             restart_counts=restart_counts,
             now=now,
             first_seen=self._first_seen,
+            first_unhealthy=self._first_unhealthy,
+            pending_replace_ids=set(self._pending_replaces),
         )
+        log.debug(events.HEALTH_COMPLETE, action_count=len(actions))
+        return actions
 
     # -- ④ act ---------------------------------------------------------------
 
     async def _act_scale(
         self,
         decision: ScaleDecision,
-        resolved: ResolvedRemoteNetwork,
         connectors: list[ManagedConnector],
         now: datetime,
         log: structlog.BoundLogger,
     ) -> None:
         """Execute a scale decision (no-op for NONE)."""
+        rn_id = self._policy.remote_network_id
         if decision.direction is ScaleDirection.UP:
             provisioned = 0
             for _ in range(decision.count):
-                if await self._provision_one(resolved, now, log) is not None:
+                if await self._provision_one(now, log) is not None:
                     provisioned += 1
             if provisioned:
-                await self._state.set_cooldown(resolved.id, ScaleDirection.UP, now)
+                await self._state.set_cooldown(rn_id, ScaleDirection.UP, now)
         elif decision.direction is ScaleDirection.DOWN:
             victims = self._pick_victims(connectors, decision.count)
             removed = 0
             for victim in victims:
-                if await self._deprovision_one(victim, resolved, now, log):
+                if await self._deprovision_one(victim, now, log):
                     removed += 1
             if removed:
-                await self._state.set_cooldown(resolved.id, ScaleDirection.DOWN, now)
+                await self._state.set_cooldown(rn_id, ScaleDirection.DOWN, now)
 
     @staticmethod
     def _pick_victims(connectors: list[ManagedConnector], count: int) -> list[ManagedConnector]:
-        """Pick up to ``count`` scale-down victims, never a locked/cordoned one.
+        """Pick up to ``count`` scale-down victims, never a cordoned one.
 
-        Connectors that are janus-locked or cordoned are excluded. Those with a
-        known logical connector id are preferred (so the logical Connector can
-        be deleted to stop routing). The model carries no creation time and the
-        Docker list order is not a reliable age signal, so within the
-        id-known group the (stable) discovery order is used only as an
-        arbitrary-but-deterministic tiebreak — not as a "newest"/"oldest"
-        guarantee.
+        Cordoned Connectors are excluded. Those with a known logical connector id
+        are preferred (so the logical Connector can be deleted to stop routing).
+        The model carries no creation time and the Docker list order is not a
+        reliable age signal, so within the id-known group the (stable) discovery
+        order is used only as an arbitrary-but-deterministic tiebreak — not as a
+        "newest"/"oldest" guarantee.
         """
-        eligible = [c for c in connectors if not c.janus_locked and not c.cordoned]
+        eligible = [c for c in connectors if not c.cordoned]
         eligible.sort(key=lambda c: c.connector_id == "")
         return eligible[:count]
 
     async def _provision_one(
         self,
-        resolved: ResolvedRemoteNetwork,
         now: datetime,
         log: structlog.BoundLogger,
         *,
@@ -532,45 +622,35 @@ class ControlLoop:
         ``"manual"`` when driven by an override endpoint, recorded on the audit
         row and the log line.
         """
-        name = self._name_factory(resolved.id)
-        log.info(events.ACTION_PROVISION_START, rn_id=resolved.id, name=name, actor=actor)
-        mem_limit = resolved.mem_ceiling_bytes or None
+        rn_id = self._policy.remote_network_id
+        name = self._name_factory(rn_id)
+        log.info(events.ACTION_PROVISION_START, rn_id=rn_id, name=name, actor=actor)
         try:
-            connector = await self._twingate.create_connector(resolved.id, name)
+            connector = await self._twingate.create_connector(rn_id, name)
             tokens = await self._twingate.generate_tokens(connector.connector_id)
         except TwingateApiError as exc:
             self._metrics.twingate_api_errors.inc()
-            log.error(events.ACTION_PROVISION_FAIL, rn_id=resolved.id, error=str(exc), actor=actor)
-            await self._record(
-                resolved.id, "provision", 1, "twingate error", "fail", now, actor=actor
-            )
+            log.error(events.ACTION_PROVISION_FAIL, rn_id=rn_id, error=str(exc), actor=actor)
+            await self._record(rn_id, "provision", 1, "twingate error", "fail", now, actor=actor)
             return None
         try:
-            await self._actuator.provision(
-                resolved.id,
-                connector.connector_id,
-                name,
-                tokens,
-                mem_limit_bytes=mem_limit,
-            )
-        except DockerActuatorError as exc:
+            await self._actuator.provision(rn_id, connector.connector_id, name, tokens)
+        except ActuatorError as exc:
             self._metrics.docker_api_errors.inc()
-            log.error(events.ACTION_PROVISION_FAIL, rn_id=resolved.id, error=str(exc), actor=actor)
-            await self._record(
-                resolved.id, "provision", 1, "docker error", "fail", now, actor=actor
-            )
+            log.error(events.ACTION_PROVISION_FAIL, rn_id=rn_id, error=str(exc), actor=actor)
+            await self._record(rn_id, "provision", 1, "docker error", "fail", now, actor=actor)
             return None
 
         log.info(
             events.ACTION_PROVISION_SUCCESS,
-            rn_id=resolved.id,
+            rn_id=rn_id,
             connector_id=connector.connector_id,
             name=name,
             actor=actor,
         )
-        self._metrics.scale_actions.labels(rn=resolved.id, direction="up").inc()
+        self._metrics.scale_actions.labels(rn=rn_id, direction="up").inc()
         await self._record(
-            resolved.id,
+            rn_id,
             "provision",
             1,
             "scale up" if actor == "auto" else "manual scale up",
@@ -584,7 +664,6 @@ class ControlLoop:
     async def _deprovision_one(
         self,
         victim: ManagedConnector,
-        resolved: ResolvedRemoteNetwork,
         now: datetime,
         log: structlog.BoundLogger,
         *,
@@ -597,11 +676,12 @@ class ControlLoop:
         (stop + remove). A failure is logged as ``action.deprovision.fail`` and
         recorded. ``actor`` is ``"manual"`` when driven by an override endpoint.
         """
+        rn_id = self._policy.remote_network_id
         log.info(
             events.ACTION_DEPROVISION_START,
-            rn_id=resolved.id,
+            rn_id=rn_id,
             connector_id=victim.connector_id,
-            drain_grace=resolved.drain_grace_seconds,
+            drain_grace=self._policy.drain_grace_seconds,
             actor=actor,
         )
         try:
@@ -611,13 +691,13 @@ class ControlLoop:
             self._metrics.twingate_api_errors.inc()
             log.error(
                 events.ACTION_DEPROVISION_FAIL,
-                rn_id=resolved.id,
+                rn_id=rn_id,
                 connector_id=victim.connector_id,
                 error=str(exc),
                 actor=actor,
             )
             await self._record(
-                resolved.id,
+                rn_id,
                 "deprovision",
                 1,
                 "twingate error",
@@ -628,21 +708,21 @@ class ControlLoop:
             )
             return False
 
-        await self._sleep(resolved.drain_grace_seconds)
+        await self._sleep(self._policy.drain_grace_seconds)
 
         try:
             await self._actuator.deprovision(victim)
-        except DockerActuatorError as exc:
+        except ActuatorError as exc:
             self._metrics.docker_api_errors.inc()
             log.error(
                 events.ACTION_DEPROVISION_FAIL,
-                rn_id=resolved.id,
+                rn_id=rn_id,
                 connector_id=victim.connector_id,
                 error=str(exc),
                 actor=actor,
             )
             await self._record(
-                resolved.id,
+                rn_id,
                 "deprovision",
                 1,
                 "docker error",
@@ -655,13 +735,13 @@ class ControlLoop:
 
         log.info(
             events.ACTION_DEPROVISION_SUCCESS,
-            rn_id=resolved.id,
+            rn_id=rn_id,
             connector_id=victim.connector_id,
             actor=actor,
         )
-        self._metrics.scale_actions.labels(rn=resolved.id, direction="down").inc()
+        self._metrics.scale_actions.labels(rn=rn_id, direction="down").inc()
         await self._record(
-            resolved.id,
+            rn_id,
             "deprovision",
             1,
             "scale down" if actor == "auto" else "manual scale down",
@@ -680,7 +760,7 @@ class ControlLoop:
         self,
         health: list[HealthAction],
         connectors: list[ManagedConnector],
-        resolved: ResolvedRemoteNetwork,
+        latest_by_connector: dict[str, ResourceSample],
         now: datetime,
         log: structlog.BoundLogger,
     ) -> None:
@@ -690,34 +770,60 @@ class ControlLoop:
             connector = by_id.get(action.connector_id)
             if connector is None:
                 continue
+            sample = latest_by_connector.get(connector.connector_id)
+            self._metrics.health_actions.labels(
+                kind=action.kind, reason_class=classify_health_reason(connector)
+            ).inc()
             if action.kind == "restart":
-                await self._restart_one(connector, resolved, action.reason, now, log)
+                await self._restart_one(connector, action.reason, sample, now, log)
             else:
-                await self._replace_one(connector, resolved, now, log)
+                await self._begin_replace(connector, action.reason, sample, now, log)
+
+    @staticmethod
+    def _sample_fields(sample: ResourceSample | None) -> dict[str, object] | None:
+        """Return a bounded, secret-free dict of a sample's signal fields.
+
+        Used to enrich health-action log lines with the triggering signal. The
+        field set is fixed (no free text), so log cardinality stays bounded;
+        ``None`` is returned when there was no sample for the Connector this
+        cycle. Samples never carry secrets.
+        """
+        if sample is None:
+            return None
+        return {
+            "cpu_pct_norm": sample.cpu_pct_norm,
+            "throughput_bps": sample.throughput_bps,
+            "mem_bytes": sample.mem_bytes,
+            "source": sample.source.value,
+        }
 
     async def _restart_one(
         self,
         connector: ManagedConnector,
-        resolved: ResolvedRemoteNetwork,
         reason: str,
+        sample: ResourceSample | None,
         now: datetime,
         log: structlog.BoundLogger,
     ) -> None:
         """Restart a Connector in place and record it."""
-        window_start = now - timedelta(seconds=resolved.restart_window_seconds)
+        rn_id = self._policy.remote_network_id
+        window_start = now - timedelta(seconds=self._policy.restart_window_seconds)
         prior = await self._state.count_recent_restarts(connector.connector_id, since=window_start)
         log.info(
             events.ACTION_RESTART,
-            rn_id=resolved.id,
+            rn_id=rn_id,
             connector_id=connector.connector_id,
             restart_count=prior + 1,
+            reason=reason,
+            state=connector.twingate_state.value if connector.twingate_state is not None else None,
+            sample=self._sample_fields(sample),
         )
         try:
             await self._actuator.restart(connector)
-        except DockerActuatorError as exc:
+        except ActuatorError as exc:
             self._metrics.docker_api_errors.inc()
             await self._record(
-                resolved.id,
+                rn_id,
                 "restart",
                 1,
                 reason,
@@ -732,9 +838,9 @@ class ControlLoop:
                 error=str(exc),
             )
             return
-        self._metrics.restarts.labels(rn=resolved.id).inc()
+        self._metrics.restarts.labels(rn=rn_id).inc()
         await self._record(
-            resolved.id,
+            rn_id,
             "restart",
             1,
             reason,
@@ -743,50 +849,156 @@ class ControlLoop:
             connector_id=connector.connector_id,
         )
 
-    async def _replace_one(
+    async def _begin_replace(
         self,
         connector: ManagedConnector,
-        resolved: ResolvedRemoteNetwork,
+        reason: str,
+        sample: ResourceSample | None,
+        now: datetime,
+        log: structlog.BoundLogger,
+        *,
+        actor: str = "auto",
+    ) -> bool:
+        """Begin a wait-for-healthy replace: provision the replacement, then wait.
+
+        Provision the net-new replacement first so capacity never dips (Key
+        Design Rule #4), then register a pending replace and return — the old,
+        unhealthy Connector is **not** torn down here. A later cycle's
+        :meth:`_process_pending_replaces` drains and deletes it only once the
+        replacement reports ALIVE/healthy. If the replacement fails to provision,
+        the old Connector is left in place for a later cycle to retry rather than
+        leaving the RN short.
+
+        ``actor`` is ``"manual"`` when driven by the override endpoint; it is
+        carried on the pending replace so the eventual ``action.replace`` audit
+        row records who initiated it. Returns whether the replacement was
+        provisioned (and a pending replace registered).
+        """
+        rn_id = self._policy.remote_network_id
+        new_id = await self._provision_one(now, log, actor=actor)
+        if new_id is None:
+            return False
+        self._pending_replaces[connector.connector_id] = _PendingReplace(
+            new_connector_id=new_id, started_at=now, reason=reason, actor=actor
+        )
+        log.info(
+            events.HEALTH_REPLACE_PENDING,
+            rn_id=rn_id,
+            old_connector_id=connector.connector_id,
+            new_connector_id=new_id,
+            restart_window_seconds=self._policy.restart_window_seconds,
+            reason=reason,
+            state=connector.twingate_state.value if connector.twingate_state is not None else None,
+            sample=self._sample_fields(sample),
+            actor=actor,
+        )
+        return True
+
+    async def _process_pending_replaces(
+        self,
+        connectors: list[ManagedConnector],
         now: datetime,
         log: structlog.BoundLogger,
     ) -> None:
-        """Replace a Connector: provision a fresh one, then drain+delete the old.
+        """Advance in-flight replaces: tear down old Connectors once new is healthy.
 
-        Provisioning the replacement first means capacity never dips during a
-        replace (Key Design Rule #4 / control-loop spec). If the replacement
-        fails to provision, the old Connector is left in place for a later
-        cycle to retry rather than leaving the RN short.
+        For each pending replace (Key Design Rule #4):
+
+        * if the old Connector already left the fleet, the replace is done —
+          forget it;
+        * if the replacement is now ALIVE/healthy, drain + delete the old
+          Connector (the completion of the replace), counting it only when the
+          old one is actually removed;
+        * if the replacement is not yet healthy but the wait has exceeded
+          ``replace_health_timeout_seconds``, this replace attempt has failed:
+          log an alertable ``health.replace_timeout`` **once**, tear down the
+          failed *replacement* (which never became ALIVE and so never carried
+          traffic — Key Design Rule #4 forbids touching the OLD, traffic-serving
+          Connector here) via the drain-before-delete path, and release the
+          pending slot. The old Connector is left running and returns to normal
+          health evaluation next cycle, where it re-escalates restart→replace —
+          a fail-forward retry, each attempt independently alertable;
+        * otherwise keep waiting.
         """
-        new_id = await self._provision_one(resolved, now, log)
-        if new_id is None:
+        if not self._pending_replaces:
             return
-        removed = await self._deprovision_one(connector, resolved, now, log)
-        log.info(
-            events.ACTION_REPLACE,
-            rn_id=resolved.id,
-            old_connector_id=connector.connector_id,
-            new_connector_id=new_id,
-            old_removed=removed,
-        )
-        # Only count a *complete* replace as success. If the replacement was
-        # provisioned but the old Connector failed to drain/remove, the RN now
-        # holds an extra (stale) Connector — record that as a failed replace so
-        # the audit history and ``fc_replacements_total`` don't overstate it.
-        # The next cycle re-evaluates the still-unhealthy old Connector.
-        if removed:
-            self._metrics.replacements.labels(rn=resolved.id).inc()
-        await self._record(
-            resolved.id,
-            "replace",
-            1,
-            (
-                "replace after restart failures"
-                if removed
-                else "replace incomplete: new provisioned, old not removed"
-            ),
-            "success" if removed else "fail",
-            now,
-            connector_id=connector.connector_id,
+        rn_id = self._policy.remote_network_id
+        by_id = {c.connector_id: c for c in connectors}
+        timeout = self._policy.replace_health_timeout_seconds
+        for old_id in list(self._pending_replaces):
+            pending = self._pending_replaces[old_id]
+            old = by_id.get(old_id)
+            if old is None:
+                # The old Connector is already gone (e.g. removed out-of-band);
+                # the replacement stands in for it. Nothing left to tear down.
+                del self._pending_replaces[old_id]
+                continue
+            new = by_id.get(pending.new_connector_id)
+            if new is not None and self._is_replacement_healthy(new):
+                removed = await self._deprovision_one(old, now, log, actor=pending.actor)
+                log.info(
+                    events.ACTION_REPLACE,
+                    rn_id=rn_id,
+                    old_connector_id=old_id,
+                    new_connector_id=pending.new_connector_id,
+                    old_removed=removed,
+                    reason=pending.reason,
+                    actor=pending.actor,
+                )
+                if removed:
+                    self._metrics.replacements.labels(rn=rn_id).inc()
+                    del self._pending_replaces[old_id]
+                await self._record(
+                    rn_id,
+                    "replace",
+                    1,
+                    (
+                        "replace complete: replacement healthy, old drained "
+                        f"(restart window {self._policy.restart_window_seconds}s)"
+                        if removed
+                        else "replace incomplete: replacement healthy but old not removed"
+                    ),
+                    "success" if removed else "fail",
+                    now,
+                    connector_id=old_id,
+                    actor=pending.actor,
+                )
+                continue
+            waited = (now - pending.started_at).total_seconds()
+            if waited >= timeout:
+                # This replace attempt failed: the replacement never became
+                # healthy in time. Emit the alertable timeout once, then clean
+                # up so we neither re-warn every cycle nor leave the failed
+                # replacement orphaned nor wedge the old Connector out of all
+                # future remediation. The OLD (traffic-serving) Connector is
+                # NEVER torn down here (Key Design Rule #4); only the failed
+                # replacement — which never carried traffic — is removed.
+                log.warning(
+                    events.HEALTH_REPLACE_TIMEOUT,
+                    rn_id=rn_id,
+                    old_connector_id=old_id,
+                    new_connector_id=pending.new_connector_id,
+                    waited_s=round(waited, 1),
+                )
+                new = by_id.get(pending.new_connector_id)
+                if new is not None:
+                    await self._deprovision_one(new, now, log)
+                # Release the slot regardless: the old Connector returns to
+                # normal health evaluation next cycle (fail-forward retry).
+                del self._pending_replaces[old_id]
+
+    @staticmethod
+    def _is_replacement_healthy(connector: ManagedConnector) -> bool:
+        """Return whether a replacement is healthy enough to retire the old one.
+
+        Requires an affirmative ALIVE from Twingate (a freshly provisioned
+        Connector reports ``DEAD_NO_HEARTBEAT`` until its first heartbeat) and a
+        Docker health that is not ``unhealthy``, so the old Connector is never
+        torn down before the replacement is genuinely carrying traffic.
+        """
+        return (
+            connector.twingate_state is ConnectorState.ALIVE
+            and connector.docker_health != "unhealthy"
         )
 
     # -- helpers -------------------------------------------------------------
@@ -819,8 +1031,7 @@ class ControlLoop:
         self,
         cycle_id: str,
         now: datetime,
-        by_rn: dict[str, list[ManagedConnector]],
-        resolved_by_rn: dict[str, ResolvedRemoteNetwork],
+        connectors: list[ManagedConnector],
         samples: list[ResourceSample],
     ) -> None:
         """Build and publish the fleet snapshot for the status UI (no-op if unset)."""
@@ -830,40 +1041,34 @@ class ControlLoop:
         for sample in samples:
             latest[sample.connector_id] = sample  # last write wins this cycle
 
-        rn_statuses: list[RemoteNetworkStatus] = []
-        for rn_id, connectors in by_rn.items():
-            resolved = resolved_by_rn[rn_id]
-            statuses: list[ConnectorStatus] = []
-            for connector in connectors:
-                latest_sample = latest.get(connector.connector_id)
-                statuses.append(
-                    ConnectorStatus(
-                        connector_id=connector.connector_id,
-                        name=connector.name,
-                        twingate_state=(
-                            connector.twingate_state.value
-                            if connector.twingate_state is not None
-                            else None
-                        ),
-                        docker_health=connector.docker_health,
-                        janus_locked=connector.janus_locked,
-                        cordoned=connector.cordoned,
-                        cpu_pct_norm=latest_sample.cpu_pct_norm if latest_sample else None,
-                        throughput_bps=latest_sample.throughput_bps if latest_sample else None,
-                        mem_bytes=latest_sample.mem_bytes if latest_sample else None,
-                    )
-                )
-            rn_statuses.append(
-                RemoteNetworkStatus(
-                    rn_id=rn_id,
-                    name=resolved.name,
-                    count=len(connectors),
-                    min_connectors=resolved.min_connectors,
-                    max_connectors=resolved.max_connectors,
-                    connectors=statuses,
+        statuses: list[ConnectorStatus] = []
+        for connector in connectors:
+            latest_sample = latest.get(connector.connector_id)
+            statuses.append(
+                ConnectorStatus(
+                    connector_id=connector.connector_id,
+                    name=connector.name,
+                    twingate_state=(
+                        connector.twingate_state.value
+                        if connector.twingate_state is not None
+                        else None
+                    ),
+                    docker_health=connector.docker_health,
+                    cordoned=connector.cordoned,
+                    cpu_pct_norm=latest_sample.cpu_pct_norm if latest_sample else None,
+                    throughput_bps=latest_sample.throughput_bps if latest_sample else None,
+                    mem_bytes=latest_sample.mem_bytes if latest_sample else None,
                 )
             )
-        self._status.publish(FleetSnapshot(cycle_id=cycle_id, ts=now, remote_networks=rn_statuses))
+        rn_status = RemoteNetworkStatus(
+            rn_id=self._policy.remote_network_id,
+            name=self._policy.remote_network_name or self._policy.remote_network_id,
+            count=len(connectors),
+            min_connectors=self._policy.min_connectors,
+            max_connectors=self._policy.max_connectors,
+            connectors=statuses,
+        )
+        self._status.publish(FleetSnapshot(cycle_id=cycle_id, ts=now, remote_network=rn_status))
 
     # -- manual overrides (Session 7) ----------------------------------------
 
@@ -884,31 +1089,28 @@ class ControlLoop:
         """
         now = self._clock()
         log = logger.bind(actor="manual", rn_id=rn_id)
-        resolved = self._policy.resolve_remote_network(rn_id)
         async with self._action_lock:
             fleet = await self._discover(log)
             connectors = [c for c in fleet if c.rn_id == rn_id]
             count = len(connectors)
 
             if direction is ScaleDirection.UP:
-                if count >= resolved.max_connectors:
+                if count >= self._policy.max_connectors:
                     log.info(events.DECIDE_NO_ACTION, reason="manual scale-up at ceiling")
                     return False
-                new_id = await self._provision_one(resolved, now, log, actor="manual")
+                new_id = await self._provision_one(now, log, actor="manual")
                 if new_id is not None:
                     await self._state.set_cooldown(rn_id, ScaleDirection.UP, now)
                 return new_id is not None
 
             if direction is ScaleDirection.DOWN:
-                if count <= resolved.min_connectors:
+                if count <= self._policy.min_connectors:
                     log.info(events.DECIDE_NO_ACTION, reason="manual scale-down at floor")
                     return False
                 victims = self._pick_victims(connectors, 1)
                 if not victims:
                     return False
-                removed = await self._deprovision_one(
-                    victims[0], resolved, now, log, actor="manual"
-                )
+                removed = await self._deprovision_one(victims[0], now, log, actor="manual")
                 if removed:
                     await self._state.set_cooldown(rn_id, ScaleDirection.DOWN, now)
                 return removed
@@ -961,3 +1163,39 @@ class ControlLoop:
             )
             log.info(events.ACTION_CORDON, cordoned=cordoned, actor="manual", rn_id=rn_id)
             return True
+
+    async def manual_replace(self, connector_id: str) -> bool:
+        """Replace one Connector via the cycle-spanning net-new path (override).
+
+        Reuses the wait-for-healthy replace path (Key Design Rule #4): the
+        net-new replacement is provisioned **now** and a pending replace is
+        registered; the target Connector is **not** torn down here — a later
+        autoscaler cycle's :meth:`_process_pending_replaces` drains and deletes
+        it only once the replacement reports ALIVE/healthy. Because the
+        replacement is added before the old one is removed, the fleet never dips
+        below ``min_connectors`` (the floor is honored implicitly). The action is
+        audited with ``actor="manual"``.
+
+        Args:
+            connector_id: The Connector to replace.
+
+        Returns:
+            ``True`` if a replacement was provisioned and the replace is now in
+            flight; ``False`` if the Connector is not in the current fleet, a
+            replace is already pending for it, or the replacement failed to
+            provision.
+        """
+        now = self._clock()
+        log = logger.bind(actor="manual", connector_id=connector_id)
+        async with self._action_lock:
+            fleet = await self._discover(log)
+            match = next((c for c in fleet if c.connector_id == connector_id), None)
+            if match is None:
+                log.warning(events.ACTION_REPLACE, reason="connector not found", actor="manual")
+                return False
+            if connector_id in self._pending_replaces:
+                log.info(events.ACTION_REPLACE, reason="replace already in flight", actor="manual")
+                return False
+            return await self._begin_replace(
+                match, "manual replace", None, now, log, actor="manual"
+            )

@@ -33,32 +33,31 @@ _POLICY = Policy.model_validate(
     {
         "poll_interval_seconds": 30,
         "connector_image": "twingate/connector:1",
-        "metrics_port": 9999,
-        "collectors": {"docker_stats": True, "stdout_metrics": False, "prometheus": True},
+        "collectors": {"docker_stats": True, "stdout_metrics": False},
         "labels": {
             "managed": "twingate.fc.managed",
             "remote_network": "twingate.fc.rn",
             "connector_id": "twingate.fc.connector_id",
         },
-        "janus_lock_label": "twingate.janus.upgrading",
-        "defaults": {
-            "min_connectors": 2,
-            "max_connectors": 6,
-            "scale_step": 1,
-            "cpu_high_pct": 75.0,
-            "cpu_low_pct": 25.0,
-            "throughput_high_mbps": 80.0,
-            "throughput_low_mbps": 10.0,
-            "mem_ceiling_bytes": 0,
-            "scale_up_window_seconds": 300,
-            "scale_down_window_seconds": 1200,
-            "scale_up_cooldown_seconds": 600,
-            "scale_down_cooldown_seconds": 1800,
-            "drain_grace_seconds": 120,
-            "max_restarts": 3,
-            "restart_window_seconds": 600,
+        "remote_network_id": "rn-1",
+        "remote_network_name": "aws-prod",
+        "min_connectors": 2,
+        "max_connectors": 6,
+        "scale_step": 1,
+        "scale_metrics": {
+            "cpu": {"high_pct": 75.0, "low_pct": 25.0, "window_seconds": 300, "agg": "avg"},
+            "throughput": {
+                "high_mbps": 80.0,
+                "low_mbps": 10.0,
+                "window_seconds": 1200,
+                "agg": "avg",
+            },
         },
-        "remote_networks": [{"id": "rn-1", "name": "aws-prod"}],
+        "scale_up_cooldown_seconds": 600,
+        "scale_down_cooldown_seconds": 1800,
+        "drain_grace_seconds": 120,
+        "max_restarts": 3,
+        "restart_window_seconds": 600,
     }
 )
 
@@ -69,6 +68,7 @@ class FakeOperator:
     def __init__(self) -> None:
         self.scale_calls: list[tuple[str, ScaleDirection]] = []
         self.cordon_calls: list[tuple[str, bool]] = []
+        self.replace_calls: list[str] = []
         self.scale_result = True
 
     async def manual_scale(self, rn_id: str, direction: ScaleDirection) -> bool:
@@ -79,33 +79,34 @@ class FakeOperator:
         self.cordon_calls.append((connector_id, cordoned))
         return True
 
+    async def manual_replace(self, connector_id: str) -> bool:
+        self.replace_calls.append(connector_id)
+        return True
+
 
 def _snapshot() -> FleetSnapshot:
     return FleetSnapshot(
         cycle_id="cyc-1",
         ts=NOW,
-        remote_networks=[
-            RemoteNetworkStatus(
-                rn_id="rn-1",
-                name="aws-prod",
-                count=2,
-                min_connectors=2,
-                max_connectors=6,
-                connectors=[
-                    ConnectorStatus(
-                        connector_id="c1",
-                        name="c1",
-                        twingate_state="ALIVE",
-                        docker_health="healthy",
-                        janus_locked=False,
-                        cordoned=False,
-                        cpu_pct_norm=42.0,
-                        throughput_bps=1_000_000.0,
-                        mem_bytes=None,
-                    )
-                ],
-            )
-        ],
+        remote_network=RemoteNetworkStatus(
+            rn_id="rn-1",
+            name="aws-prod",
+            count=2,
+            min_connectors=2,
+            max_connectors=6,
+            connectors=[
+                ConnectorStatus(
+                    connector_id="c1",
+                    name="c1",
+                    twingate_state="ALIVE",
+                    docker_health="healthy",
+                    cordoned=False,
+                    cpu_pct_norm=42.0,
+                    throughput_bps=1_000_000.0,
+                    mem_bytes=None,
+                )
+            ],
+        ),
     )
 
 
@@ -160,8 +161,8 @@ def test_status_api_returns_full_payload(tmp_path: Path) -> None:
         resp = client.get("/api/status")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["snapshot"]["remote_networks"][0]["name"] == "aws-prod"
-    assert body["snapshot"]["remote_networks"][0]["connectors"][0]["twingate_state"] == "ALIVE"
+    assert body["snapshot"]["remote_network"]["name"] == "aws-prod"
+    assert body["snapshot"]["remote_network"]["connectors"][0]["twingate_state"] == "ALIVE"
     assert body["actions"][0]["action"] == "provision"
     assert any(e["event"] == "loop.cycle.complete" for e in body["events"])
     assert body["config"]["poll_interval_seconds"] == 30
@@ -230,6 +231,41 @@ def test_override_cordon_with_secret_acts(tmp_path: Path) -> None:
         )
     assert resp.status_code == 200
     assert operator.cordon_calls == [("c1", True)]
+
+
+def test_override_replace_disabled_returns_403(tmp_path: Path) -> None:
+    client, operator, _state = _build_client(tmp_path, override_enabled=False)
+    with client:
+        resp = client.post("/api/overrides/replace", json={"connector_id": "c1"})
+    assert resp.status_code == 403
+    assert operator.replace_calls == []
+
+
+def test_override_replace_requires_secret(tmp_path: Path) -> None:
+    client, operator, _state = _build_client(tmp_path, override_enabled=True)
+    with client:
+        missing = client.post("/api/overrides/replace", json={"connector_id": "c1"})
+        wrong = client.post(
+            "/api/overrides/replace",
+            json={"connector_id": "c1"},
+            headers={"X-FC-Override-Secret": "nope"},
+        )
+    assert missing.status_code == 401
+    assert wrong.status_code == 401
+    assert operator.replace_calls == []
+
+
+def test_override_replace_with_secret_acts(tmp_path: Path) -> None:
+    client, operator, _state = _build_client(tmp_path, override_enabled=True)
+    with client:
+        resp = client.post(
+            "/api/overrides/replace",
+            json={"connector_id": "c1"},
+            headers={"X-FC-Override-Secret": SECRET},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["acted"] is True
+    assert operator.replace_calls == ["c1"]
 
 
 def test_override_scale_rejects_bad_direction(tmp_path: Path) -> None:

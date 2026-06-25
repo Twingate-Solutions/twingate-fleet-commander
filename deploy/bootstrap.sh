@@ -3,27 +3,26 @@
 # bootstrap.sh — stand up a Fleet Commander host from scratch.
 #
 # Idempotent and safe to re-run. It will:
-#   1. Verify (and, if missing, install) Docker Engine + the compose plugin and jq.
+#   1. Verify (and, if missing, install) Docker Engine + the compose plugin.
 #   2. Lay down .env and config/config.yaml from the committed examples.
 #   3. Collect TWINGATE_NETWORK + TWINGATE_API_KEY (from the environment or by prompt).
-#   4. Mint per-connector tokens for the seed Connectors via the Twingate GraphQL API
-#      (connectorCreate -> connectorGenerateTokens) and write them into .env.
-#      Skipped if the tokens are already present, or entirely if FC_SKIP_SEED=1.
-#   5. Pull images and `docker compose up -d`.
-#   6. Poll the manager's /healthz and /readyz until both are green.
+#   4. Pull images and `docker compose up -d` (the manager + janus).
+#   5. Poll the manager's /healthz and /readyz until both are green.
+#
+# FC self-provisions its Connectors: it brings the Remote Network up to
+# `min_connectors` from empty and scales on load, minting tokens via the Twingate
+# API and injecting them straight into the containers it runs. There are NO seed
+# Connectors and NO connector tokens in .env.
 #
 # Usage:
 #   ./deploy/bootstrap.sh
-#   TWINGATE_NETWORK=acme TWINGATE_API_KEY=tgp_... SEED_RN_ID=UmVt... ./deploy/bootstrap.sh
-#   FC_SKIP_SEED=1 ./deploy/bootstrap.sh        # don't mint/start seed connectors
+#   TWINGATE_NETWORK=acme TWINGATE_API_KEY=tgp_... ./deploy/bootstrap.sh
 #
 # Environment overrides (all optional; prompted when needed and a TTY is available):
 #   TWINGATE_NETWORK   network slug for https://<slug>.twingate.com
-#   TWINGATE_API_KEY   Admin/DevOps API key (used only to mint seed tokens; written to .env)
-#   SEED_RN_ID         Remote Network id the seed connectors join
-#   FC_SKIP_SEED      "1" to skip seed minting and start only the manager + janus
-#   FC_HEALTH_URL     base URL to poll (default http://localhost:8080)
-#   FC_WAIT_TIMEOUT   seconds to wait for health (default 180)
+#   TWINGATE_API_KEY   Admin/DevOps API key (FC uses it to create/delete connectors)
+#   FC_HEALTH_URL      base URL to poll (default http://localhost:8080)
+#   FC_WAIT_TIMEOUT    seconds to wait for health (default 180)
 
 set -euo pipefail
 
@@ -75,25 +74,6 @@ install_docker() {
   fi
 }
 
-install_jq() {
-  if command -v jq >/dev/null 2>&1; then
-    return 0
-  fi
-  log "jq not found — installing"
-  require_root_or_sudo
-  if command -v apt-get >/dev/null 2>&1; then
-    ${SUDO} apt-get update -qq && ${SUDO} apt-get install -y -qq jq
-  elif command -v dnf >/dev/null 2>&1; then
-    ${SUDO} dnf install -y -q jq
-  elif command -v yum >/dev/null 2>&1; then
-    ${SUDO} yum install -y -q jq
-  elif command -v apk >/dev/null 2>&1; then
-    ${SUDO} apk add --no-cache jq
-  else
-    die "could not install jq automatically; install it and re-run"
-  fi
-}
-
 # ── .env helpers ────────────────────────────────────────────────────────────
 # Read the value of KEY from .env (last assignment wins, "" if unset/blank).
 get_env() {
@@ -107,9 +87,11 @@ set_env() {
   local key="$1" value="$2" tmp
   tmp="$(mktemp)"
   if grep -qE "^${key}=" "$ENV_FILE"; then
-    awk -v k="$key" -v v="$value" '
-      BEGIN { FS = "=" }
-      $1 == k { print k "=" v; next }
+    # Pass the value via ENVIRON (not `-v`, which backslash-escape-processes it),
+    # so secrets containing backslashes are written verbatim.
+    SET_ENV_KEY="$key" SET_ENV_VAL="$value" awk '
+      BEGIN { FS = "="; k = ENVIRON["SET_ENV_KEY"] }
+      $1 == k { print k "=" ENVIRON["SET_ENV_VAL"]; next }
       { print }
     ' "$ENV_FILE" >"$tmp"
   else
@@ -162,111 +144,16 @@ collect_secrets() {
   [ -n "$api_key" ] || die "TWINGATE_API_KEY is required"
   set_env TWINGATE_NETWORK "$network"
   set_env TWINGATE_API_KEY "$api_key"
-  # Export for the GraphQL helpers below.
-  TWINGATE_NETWORK="$network"
-  TWINGATE_API_KEY="$api_key"
-  log "Twingate network: ${TWINGATE_NETWORK} (API key set, not shown)"
-}
-
-# ── GraphQL (seed token minting) ──────────────────────────────────────────────
-GQL_ENDPOINT=""
-
-graphql() {
-  # $1 = GraphQL document, $2 = JSON object of variables.
-  local query="$1" variables="$2" body
-  body="$(jq -n --arg q "$query" --argjson v "$variables" '{query: $q, variables: $v}')"
-  curl -fsS -X POST "$GQL_ENDPOINT" \
-    -H "X-API-KEY: ${TWINGATE_API_KEY}" \
-    -H "Content-Type: application/json" \
-    --data "$body"
-}
-
-# Find an existing connector id by name (echoes id or empty). Tolerates filter quirks.
-find_connector_id() {
-  local name="$1" resp
-  # shellcheck disable=SC2016  # $name is a GraphQL variable, not a shell expansion
-  resp="$(graphql \
-    'query($name: String) { connectors(first: 100, filter: { name: { eq: $name } }) { edges { node { id name } } } }' \
-    "$(jq -n --arg name "$name" '{name: $name}')" 2>/dev/null || true)"
-  printf '%s' "$resp" | jq -r --arg name "$name" \
-    '.data.connectors.edges[]? | select(.node.name == $name) | .node.id' 2>/dev/null | head -n1 || true
-}
-
-# Create connector $name in $SEED_RN_ID if absent; echo its id.
-create_connector() {
-  local name="$1" existing resp id
-  existing="$(find_connector_id "$name")"
-  if [ -n "$existing" ]; then
-    log "reusing existing connector '${name}' (${existing})"
-    printf '%s' "$existing"
-    return 0
-  fi
-  # shellcheck disable=SC2016  # $rn/$name are GraphQL variables, not shell expansions
-  resp="$(graphql \
-    'mutation($rn: ID!, $name: String) { connectorCreate(remoteNetworkId: $rn, name: $name) { ok error entity { id } } }' \
-    "$(jq -n --arg rn "$SEED_RN_ID" --arg name "$name" '{rn: $rn, name: $name}')")"
-  if [ "$(printf '%s' "$resp" | jq -r '.data.connectorCreate.ok')" != "true" ]; then
-    die "connectorCreate failed for '${name}': $(printf '%s' "$resp" | jq -r '.data.connectorCreate.error // .errors // "unknown"')"
-  fi
-  id="$(printf '%s' "$resp" | jq -r '.data.connectorCreate.entity.id')"
-  log "created connector '${name}' (${id})"
-  printf '%s' "$id"
-}
-
-# Mint tokens for connector id $1; sets ${2}_ACCESS_TOKEN / ${2}_REFRESH_TOKEN in .env.
-mint_tokens() {
-  local connector_id="$1" prefix="$2" resp access refresh
-  # shellcheck disable=SC2016  # $id is a GraphQL variable, not a shell expansion
-  resp="$(graphql \
-    'mutation($id: ID!) { connectorGenerateTokens(connectorId: $id) { ok error connectorTokens { accessToken refreshToken } } }' \
-    "$(jq -n --arg id "$connector_id" '{id: $id}')")"
-  if [ "$(printf '%s' "$resp" | jq -r '.data.connectorGenerateTokens.ok')" != "true" ]; then
-    die "connectorGenerateTokens failed for ${connector_id}: $(printf '%s' "$resp" | jq -r '.data.connectorGenerateTokens.error // "unknown"')"
-  fi
-  access="$(printf '%s' "$resp" | jq -r '.data.connectorGenerateTokens.connectorTokens.accessToken')"
-  refresh="$(printf '%s' "$resp" | jq -r '.data.connectorGenerateTokens.connectorTokens.refreshToken')"
-  [ -n "$access" ] && [ "$access" != "null" ] || die "no access token returned for ${connector_id}"
-  set_env "${prefix}_ACCESS_TOKEN" "$access"
-  set_env "${prefix}_REFRESH_TOKEN" "$refresh"
-  log "minted tokens for ${prefix} (values written to .env, not shown)"
-}
-
-provision_seeds() {
-  if [ "${FC_SKIP_SEED:-0}" = "1" ]; then
-    warn "FC_SKIP_SEED=1 — skipping seed connectors; will start manager + janus only"
-    return 0
-  fi
-  if [ -n "$(get_env SEED1_ACCESS_TOKEN)" ] && [ -n "$(get_env SEED2_ACCESS_TOKEN)" ]; then
-    log "seed tokens already present in .env — skipping minting"
-    return 0
-  fi
-
-  install_jq
-  GQL_ENDPOINT="https://${TWINGATE_NETWORK}.twingate.com/api/graphql/"
-
-  local rn id1 id2
-  rn="$(prompt_if_empty "${SEED_RN_ID:-$(get_env SEED_RN_ID)}" "SEED_RN_ID (Remote Network id for the seed connectors)" plain)"
-  [ -n "$rn" ] || die "SEED_RN_ID is required to mint seed tokens (or set FC_SKIP_SEED=1)"
-  set_env SEED_RN_ID "$rn"
-  SEED_RN_ID="$rn"
-
-  log "minting seed connector tokens against ${GQL_ENDPOINT}"
-  id1="$(create_connector "fc-seed-1")"
-  mint_tokens "$id1" "SEED1"
-  id2="$(create_connector "fc-seed-2")"
-  mint_tokens "$id2" "SEED2"
+  log "Twingate network: ${network} (API key set, not shown)"
+  warn "set the Remote Network FC manages in config/config.yaml (remote_network_id) before relying on autoscaling"
 }
 
 # ── Bring up the stack ─────────────────────────────────────────────────────
 compose_up() {
   log "pulling images"
   ( cd "$REPO_ROOT" && docker compose pull --quiet 2>/dev/null || true )
-  log "starting the stack"
-  if [ "${FC_SKIP_SEED:-0}" = "1" ]; then
-    ( cd "$REPO_ROOT" && docker compose up -d --build fc janus )
-  else
-    ( cd "$REPO_ROOT" && docker compose up -d --build )
-  fi
+  log "starting the stack (manager + janus; FC self-provisions the connectors)"
+  ( cd "$REPO_ROOT" && docker compose up -d --build )
 }
 
 wait_healthy() {
@@ -288,7 +175,7 @@ wait_healthy() {
       sleep 3
     done
   done
-  log "manager is healthy — status UI at ${HEALTH_URL}/"
+  log "manager is healthy — status UI at ${HEALTH_URL}/ (loopback by default)"
 }
 
 main() {
@@ -296,7 +183,6 @@ main() {
   install_docker
   ensure_files
   collect_secrets
-  provision_seeds
   compose_up
   wait_healthy
   log "done."

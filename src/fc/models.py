@@ -2,10 +2,10 @@
 
 These are the authoritative in-memory shapes that flow through the control
 loop: collectors emit :class:`ResourceSample`, discovery yields
-:class:`ManagedConnector`, the aggregator groups them into a
-:class:`RemoteNetworkView`, and the decider produces :class:`ScaleDecision`
-and :class:`HealthAction` objects that the actuator executes and the state
-store records as :class:`ActionRecord` rows.
+:class:`ManagedConnector`, the aggregator reduces samples into per-metric
+windowed values, and the decider produces :class:`ScaleDecision` and
+:class:`HealthAction` objects that the actuator executes and the state store
+records as :class:`ActionRecord` rows.
 
 No secret material ever lives on these models; tokens and the API key are
 write-only into Docker env and the GraphQL auth header.
@@ -36,7 +36,11 @@ class CollectorSource(StrEnum):
 
     DOCKER_STATS = "docker_stats"
     STDOUT_METRICS = "stdout_metrics"
-    PROMETHEUS = "prometheus"
+    # Cloud log-based collectors: the custom image emits the same ``[metrics]``
+    # stdout lines on every platform; on the cloud backends FC reads them from
+    # the platform's log service instead of the Docker log API.
+    CLOUDWATCH_LOGS = "cloudwatch_logs"
+    AZURE_MONITOR = "azure_monitor"
 
 
 class ResourceSample(BaseModel):
@@ -44,8 +48,9 @@ class ResourceSample(BaseModel):
 
     CPU is already normalized to per-effective-core utilization (0..100) by
     the collector. Memory fields are advisory and may be ``None`` when the
-    container has no memory limit. Throughput is tunnel bytes/sec from the
-    Prometheus scrape, or a NIC-based fallback.
+    container has no memory limit. Throughput is tunnel bytes/sec, derived
+    from the connector's stdout metrics (custom image) or a docker_stats
+    NIC-delta fallback (universal).
     """
 
     connector_id: str
@@ -61,9 +66,13 @@ class ManagedConnector(BaseModel):
     """A Connector under FC management, rediscovered every control cycle.
 
     A Connector may be logical-only (``container_id is None``) while mid-
-    provision, or fully realized with a running container. ``janus_locked``
-    marks a Connector being upgraded by janus (FC yields), and ``cordoned``
-    is a manual override that excludes it from autoscaling decisions.
+    provision, or fully realized with a running container. ``cordoned`` is a
+    manual override that excludes it from autoscaling decisions.
+
+    ``docker_health`` is the authoritative ``State.Health.Status`` read from the
+    container inspect (``"healthy"``/``"unhealthy"``/``"starting"``), or ``None``
+    when the container has no healthcheck; ``docker_failing_streak`` is the
+    inspect's consecutive-failure counter, surfaced for observability.
     """
 
     connector_id: str
@@ -73,7 +82,7 @@ class ManagedConnector(BaseModel):
     twingate_state: ConnectorState | None = None
     last_heartbeat_at: datetime | None = None
     docker_health: str | None = None
-    janus_locked: bool = False
+    docker_failing_streak: int | None = None
     cordoned: bool = False
 
 
@@ -127,17 +136,3 @@ class ActionRecord(BaseModel):
     reason: str
     outcome: Literal["success", "fail"]
     actor: Literal["auto", "manual"] = "auto"
-
-
-class RemoteNetworkView(BaseModel):
-    """The per-Remote-Network rollup the decider consumes each cycle.
-
-    Bundles the Connectors discovered in one Remote Network with the windowed
-    aggregates (e.g. average normalized CPU, average throughput, connector
-    count) computed by the aggregator.
-    """
-
-    rn_id: str
-    name: str
-    connectors: list[ManagedConnector]
-    aggregates: dict[str, float]

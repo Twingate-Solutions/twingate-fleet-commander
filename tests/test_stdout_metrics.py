@@ -10,6 +10,8 @@ logical-only cases.
 import json
 from typing import Any
 
+import structlog
+
 from fc.collectors.stdout_metrics import StdoutMetricsCollector, parse_metrics_line
 from fc.models import CollectorSource, ManagedConnector
 
@@ -162,3 +164,32 @@ async def test_collect_logical_only_connector_returns_none() -> None:
     collector = StdoutMetricsCollector(docker, host_cpus=8)  # type: ignore[arg-type]
 
     assert await collector.collect(_connector(container_id=None)) is None
+
+
+async def test_collect_warns_once_on_schema_drift() -> None:
+    # A well-formed metrics line that carries none of the known fields is schema
+    # drift: every metric maps to None. It must be warned about exactly once.
+    drift = '[2026-06-24 12:00:00] [metrics] {"event":"metrics","unknown_field":1}'
+    docker = _docker([drift])
+    collector = StdoutMetricsCollector(docker, host_cpus=8)  # type: ignore[arg-type]
+
+    with structlog.testing.capture_logs() as cap:
+        sample = await collector.collect(_connector())
+        await collector.collect(_connector())  # second call must not warn again
+
+    warns = [e for e in cap if e["event"] == "stdout_metrics.schema_drift"]
+    assert len(warns) == 1
+    assert sample is not None
+    assert sample.cpu_pct_norm is None
+    assert sample.throughput_bps is None
+    assert sample.mem_bytes is None
+
+
+async def test_collect_no_drift_warn_for_known_schema() -> None:
+    docker = _docker([_metrics_line()])
+    collector = StdoutMetricsCollector(docker, host_cpus=8)  # type: ignore[arg-type]
+
+    with structlog.testing.capture_logs() as cap:
+        await collector.collect(_connector())
+
+    assert not [e for e in cap if e["event"] == "stdout_metrics.schema_drift"]

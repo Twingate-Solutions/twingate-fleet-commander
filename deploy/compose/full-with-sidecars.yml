@@ -1,0 +1,73 @@
+# Fleet Commander — FULL variant: manager + janus + log-shipper.
+#
+# Everything: FC autoscaling, janus auto-updating the connectors FC enrols
+# (via the janus.autoupdate.* labels FC stamps on provision), and the optional
+# log-shipper pushing connector analytics to an S3-compatible bucket.
+#
+# The root ../../docker-compose.yml is the rich, fully-commented canonical
+# example; this variant mirrors it. Configure secrets in ../../.env (including the
+# TWINGATE_SHIPPER_* block for the shipper) and policy in ../../config/config.yaml
+# (the `janus:` block controls the enrolment labels).
+#
+# Run from the repo root:
+#   docker compose -f deploy/compose/full-with-sidecars.yml up -d                 # fc + janus
+#   docker compose -f deploy/compose/full-with-sidecars.yml --profile shipping up -d  # + log-shipper
+
+services:
+  fc:
+    build: ../..
+    image: fleet-commander:dev
+    container_name: fc
+    restart: unless-stopped
+    env_file: ../../.env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../../config/config.yaml:/app/config/config.yaml:ro
+      - fc_state:/app/state
+    ports:
+      - "127.0.0.1:8080:8080"   # loopback by default; public exposure only behind TLS
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz', timeout=3).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # janus has no lock: FC enrols every connector it provisions with janus's
+  # auto-update labels and tolerates the brief upgrade-recreate via the grace
+  # windows. Mounts the socket like FC does.
+  janus:
+    image: ghcr.io/twingate-solutions/janus-updater-service:latest
+    container_name: fc-janus
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # Optional: ships connector log FILES (not the socket) to an S3-compatible
+  # bucket (e.g. GCS via S3 interop). Behind the `shipping` profile (off unless
+  # requested). Scoped env so FC's TWINGATE_API_KEY is never handed to it.
+  log-shipper:
+    image: ghcr.io/twingate-solutions/twingate-connector-log-shipper:latest
+    container_name: fc-log-shipper
+    profiles: [ "shipping" ]
+    restart: unless-stopped
+    environment:
+      TWINGATE_SHIPPER_S3_BUCKET: "${TWINGATE_SHIPPER_S3_BUCKET}"
+      TWINGATE_SHIPPER_S3_ACCESS_KEY_ID: "${TWINGATE_SHIPPER_S3_ACCESS_KEY_ID}"
+      TWINGATE_SHIPPER_S3_SECRET_ACCESS_KEY: "${TWINGATE_SHIPPER_S3_SECRET_ACCESS_KEY}"
+      TWINGATE_SHIPPER_S3_ENDPOINT_URL: "${TWINGATE_SHIPPER_S3_ENDPOINT_URL:-}"
+      TWINGATE_SHIPPER_S3_REGION: "${TWINGATE_SHIPPER_S3_REGION:-}"
+      TWINGATE_SHIPPER_S3_PREFIX: "${TWINGATE_SHIPPER_S3_PREFIX:-}"
+      TWINGATE_SHIPPER_DOCKER_CONTAINER_NAME_FILTER: "${TWINGATE_SHIPPER_DOCKER_CONTAINER_NAME_FILTER:-twingate-custom-connector-container}"
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+
+volumes:
+  fc_state:

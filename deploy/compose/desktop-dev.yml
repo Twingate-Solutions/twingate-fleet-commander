@@ -1,0 +1,19 @@
+# Fleet Commander — DESKTOP DEV variant (Docker Desktop on Windows/macOS).
+#
+# On Docker Desktop the Linux-VM /var/run/docker.sock is owned root:root mode
+# 0660, so the image's non-root `fc` user (uid 10001) gets EACCES on it. Adding
+# supplementary group 0 grants the group-rw the socket allows, without running
+# the whole process as root. This supersedes the old loose
+# ../../docker-compose.override.yml (which auto-merged into every run).
+#
+# Production hosts should instead add `fc` to the host docker group, or use
+# deploy/compose/socket-proxy-hardened.yml. Do NOT use this variant in production.
+#
+# Run from the repo root:
+#   docker compose -f deploy/compose/minimal.yml -f deploy/compose/desktop-dev.yml up -d
+
+services:
+  fc:
+    # group_add layers onto whichever base service you select with the first -f.
+    group_add:
+      - "0"

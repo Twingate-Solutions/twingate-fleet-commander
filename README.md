@@ -23,43 +23,49 @@ via structured stdout logs and a Prometheus `/metrics` endpoint.
 
 ## Quickstart — stand up a host
 
-The fastest path is the bootstrap script, which installs Docker, lays down config, mints
-the seed Connectors' tokens via the Twingate API, brings the stack up, and waits until the
-manager is healthy. It is **idempotent** — safe to re-run.
+The fastest path is the bootstrap script, which installs Docker, lays down config, brings
+the stack up, and waits until the manager is healthy. FC then **self-provisions** its
+Connectors — there are no seed Connectors to mint tokens for. It is **idempotent** — safe
+to re-run.
 
 ```bash
 git clone <this-repo> fleet-commander
 cd fleet-commander
 
-# Interactive (prompts for network slug, API key, seed Remote Network id):
+# Interactive (prompts for network slug + API key):
 ./deploy/bootstrap.sh
 
 # Or non-interactive:
 TWINGATE_NETWORK=acme \
 TWINGATE_API_KEY=tgp_xxxxxxxx \
-SEED_RN_ID=UmVtb3RlTmV0d29yazoxMjM= \
 ./deploy/bootstrap.sh
 ```
 
-When it finishes, the status UI + health/metrics are on **port 8080**:
+When it finishes, the status UI + health/metrics are on **port 8080**, bound to **loopback
+by default** (reach it via an SSH tunnel — `ssh -L 8080:localhost:8080 <host>` — or front it
+with a TLS proxy; see [Manual overrides](#manual-overrides-optional-off-by-default)):
 
-- `http://<host>:8080/` — status UI
-- `http://<host>:8080/healthz` — liveness
-- `http://<host>:8080/readyz` — readiness (Docker socket + Twingate API reachable)
-- `http://<host>:8080/metrics` — Prometheus exposition
+- `http://localhost:8080/` — status UI
+- `http://localhost:8080/healthz` — liveness
+- `http://localhost:8080/readyz` — readiness (Docker socket + Twingate API reachable)
+- `http://localhost:8080/metrics` — Prometheus exposition
 
 ### Manual / non-bootstrap path
 
 ```bash
-cp .env.example .env                          # set TWINGATE_NETWORK + TWINGATE_API_KEY (+ seed tokens)
-cp config/config.example.yaml config/config.yaml
-docker compose up -d                          # manager + seed connectors + janus
+cp .env.example .env                          # set TWINGATE_NETWORK + TWINGATE_API_KEY
+cp config/config.example.yaml config/config.yaml   # defaults to the custom connector image
+docker compose up -d                          # manager + janus; FC provisions the connectors
 docker compose --profile shipping up -d       # also start the optional log-shipper
 ```
 
-Seed connectors need per-connector tokens in `.env` (`SEED1_ACCESS_TOKEN`, …). `bootstrap.sh`
-mints these for you (`connectorCreate` → `connectorGenerateTokens`); if you skip bootstrap,
-mint them yourself or set `FC_SKIP_SEED=1` and let FC provision up to the floor on its own.
+**No seed Connectors, no connector tokens in `.env`.** FC brings the Remote Network up to
+`min_connectors` from empty and scales on load, minting tokens via the Twingate API and
+injecting them straight into the containers it runs. Just start the manager and it fills the
+floor itself.
+
+For other topologies (minimal, hardened socket-proxy, Docker Desktop, cloud VM), see the
+thin variants in [`deploy/compose/`](deploy/compose/).
 
 ### First-boot on a cloud VM
 
@@ -73,10 +79,9 @@ generic Proxmox**. See [`deploy/cloud-init/README.md`](deploy/cloud-init/README.
 
 | Service | Role | Notes |
 |---|---|---|
-| `fc` | the manager (this project) | control loop + status UI + `/metrics`; mounts the Docker socket |
-| `connector-seed-1/2` | seed Connectors | FC discovers and scales from these (labels match `config.yaml`) |
-| `janus` | Connector version updater | FC yields to it via the upgrade-lock label; never fights it |
-| `log-shipper` | stdout → SIEM (optional) | behind the `shipping` compose profile |
+| `fc` | the manager (this project) | control loop + status UI + `/metrics`; mounts the Docker socket. Self-provisions the Connectors (no seed services) — fills the Remote Network to `min_connectors` and scales on load |
+| `janus` | Connector version updater | no lock — FC enrols the Connectors it provisions with janus auto-update labels and tolerates the brief upgrade-recreate via the grace windows |
+| `log-shipper` | connector logs → S3-compatible bucket (optional) | behind the `shipping` compose profile; see [above](#optional-ship-connector-analytics-to-a-non-aws-bucket) |
 
 ### ⚠️ The Docker socket is root-equivalent
 
@@ -84,14 +89,31 @@ FC mounts `/var/run/docker.sock` so its actuator can run/stop/remove Connector c
 Anything that can reach the daemon socket can control the host. Treat the FC host as a
 trusted control-plane node:
 
-- Bind port 8080 to a trusted/loopback interface behind a TLS-terminating proxy; never
-  expose the status UI / override endpoints to the public internet.
+- Port 8080 binds to **loopback by default**; expose the status UI / override endpoints
+  publicly only behind a TLS-terminating proxy, never directly on the public internet.
 - For hardened deployments, front the daemon with a **read-mostly socket proxy** that
-  allowlists only the container-lifecycle calls FC needs (a commented `socket-proxy`
-  service is included in `docker-compose.yml`, enabled via `--profile hardened`).
+  allowlists only the container-lifecycle calls FC needs — see
+  [`deploy/compose/socket-proxy-hardened.yml`](deploy/compose/socket-proxy-hardened.yml)
+  (FC talks to it via `DOCKER_HOST=tcp://socket-proxy:2375` and never mounts the raw socket).
+  Note the proxy reduces the reachable Docker API *surface* (no exec/secrets/images/swarm)
+  but does **not** make its network safe: allowing `containers/create` still permits a
+  privileged-bind container that owns the host, so the proxy network remains a trust
+  boundary that only FC may reach.
 - The config volume is mounted read-only so a compromised loop can't rewrite policy.
 
 See [`documentation/ARCHITECTURE.md`](documentation/ARCHITECTURE.md) → *Nine non-negotiable design rules* (Rule 9, the actuator interface) and the control-plane trust model.
+
+### Compute backends — Docker, AWS ECS, Azure ACI
+
+FC actuates one compute backend, chosen explicitly by `FC_PLATFORM` (`docker` default, `ecs`, or `aci` — no auto-detection, since FC deletes compute). The same control loop, decision engine, and observability drive all three behind the backend-agnostic `Actuator` interface (Rule #9):
+
+| `FC_PLATFORM` | Backend | Compute unit | Metrics source | Install extra |
+|---|---|---|---|---|
+| `docker` | local Docker | one container per Connector | Docker socket (`docker_stats` / `stdout_metrics`) | — |
+| `ecs` | AWS ECS (`RunTask`, 1:1) | one task per Connector | CloudWatch Logs | `pip install -e '.[ecs]'` |
+| `aci` | Azure Container Instances | one container group per Connector | Log Analytics | `pip install -e '.[aci]'` |
+
+Every backend applies the prescribed **1 vCPU / 2 GB** sizing (Rule N2) and upholds the single-use-token rule (a token is never active on two containers/tasks/groups at once; cloud "restart" relaunches the **same** token sequentially). Per-platform setup — API mapping, least-privilege IAM/Azure roles, settings, and collection — is in [`docs/platforms/ecs.md`](docs/platforms/ecs.md) and [`docs/platforms/aci.md`](docs/platforms/aci.md).
 
 ---
 
@@ -184,12 +206,91 @@ contains a secret. Full catalog: [`documentation/OBSERVABILITY.md`](documentatio
 
 ## Configuration
 
-- **Secrets** (env / `.env`): `TWINGATE_NETWORK`, `TWINGATE_API_KEY`, seed tokens. See
-  [`.env.example`](.env.example). Never commit a real `.env`.
-- **Policy** (non-secret YAML): watermarks, windows, cooldowns, per-RN floors/ceilings,
-  collector toggles, labels. See [`config/config.example.yaml`](config/config.example.yaml).
+- **Secrets** (env / `.env`): `TWINGATE_NETWORK`, `TWINGATE_API_KEY`, the optional override
+  secret, and the optional `TWINGATE_SHIPPER_*` block. See [`.env.example`](.env.example).
+  Never commit a real `.env`. (No connector tokens — FC mints those itself.)
+- **Policy** (non-secret YAML): the connector image (defaults to the custom image),
+  watermarks, windows, cooldowns, floor/ceiling, collector toggles, labels, and the `janus:`
+  enrolment block. See [`config/config.example.yaml`](config/config.example.yaml).
 
 Full reference: [`documentation/CONFIGURATION.md`](documentation/CONFIGURATION.md).
+
+### Scale-up trigger: any / mean / quorum (the sticky-connector problem)
+
+Connectors in a Remote Network load-balance *new* connections, but existing ones stay
+pinned where they landed — so a fleet can end up with **one hot Connector** while the
+rest sit idle. The `scale_up_trigger` policy knob chooses how per-connector
+high-watermark crossings combine into one fleet scale-up decision:
+
+- **`any`** — scale up if *any single* Connector is over its high watermark (most
+  reactive; one hot Connector adds capacity).
+- **`mean`** — scale up on the *fleet-average* windowed signal; smooth, but one hot
+  Connector can be **diluted** by quiet ones and never trigger.
+- **`quorum`** *(default)* — scale up only when a configurable fraction of Connectors
+  are hot (`quorum_fraction`, default `0.5`; threshold `= max(1, ceil(fraction × count))`).
+
+Why not always scale on one hot Connector? Adding a Connector only helps if new
+connections land on it. If clients stay pinned to the hot one, the new Connector sits
+idle and the bottleneck remains — so **chronic single-connector stickiness is usually a
+load-balancing problem, not a capacity one.** Watch `connectors_over_high_watermark` and
+`hot_connector_max` in the decision logs/metrics: a persistently high `hot_connector_max`
+with only one Connector over the watermark is the sticky-Connector signature (fix
+balancing, don't lower the quorum). Tune `scale_up_trigger`/`quorum_fraction` over time.
+**Scale-down is unchanged** — it stays deliberately conservative, removing capacity only
+when *every* present signal is at/below its low watermark (the whole fleet is quiet).
+
+---
+
+## Optional: ship connector analytics to a non-AWS bucket
+
+Twingate's connector log-shipper natively targets AWS S3. The bundled
+`log-shipper` service (behind the `shipping` compose profile, **off by default**) lets you
+push connector real-time analytics / stdout to **any S3-compatible bucket** — e.g. Google
+Cloud Storage via its S3 interoperability endpoint.
+
+- The shipper reads container **log files**, so it mounts `/var/lib/docker/containers:ro`
+  (not the Docker socket).
+- Configure it with the `TWINGATE_SHIPPER_*` block in [`.env.example`](.env.example). It
+  gets a **scoped** env set — FC's `TWINGATE_API_KEY` is never handed to the shipper.
+- **GCS (S3 interop):** set `TWINGATE_SHIPPER_S3_ENDPOINT_URL=https://storage.googleapis.com`
+  and use a **GCS HMAC key pair** (Cloud Storage → Settings → Interoperability) as
+  `TWINGATE_SHIPPER_S3_ACCESS_KEY_ID` / `TWINGATE_SHIPPER_S3_SECRET_ACCESS_KEY`.
+- Set `TWINGATE_SHIPPER_DOCKER_CONTAINER_NAME_FILTER` to a substring of the connector image
+  you provision — the shipper's default `twingate/connector` does **not** match the custom
+  image (`twingate-custom-connector-container`).
+
+```bash
+docker compose --profile shipping up -d   # start FC + janus + the shipper
+```
+
+---
+
+## Manual overrides (optional, off by default)
+
+The status UI can expose guarded manual controls — **scale ±1**, **cordon/uncordon** a
+Connector, and **replace** a Connector — for operators who need to act between autoscaler
+cycles. They are **disabled by default** (`FC_OVERRIDE_ENABLED=false`). When enabled they
+require a shared secret (`FC_OVERRIDE_SECRET`, ≥16 chars) sent in the
+`X-FC-Override-Secret` request header and constant-time compared.
+
+- **Replace** is a **net-new, wait-for-healthy** operation: FC provisions a fresh
+  Connector, waits for it to report `ALIVE`/healthy, and only then drains and deletes the
+  target — so the fleet never dips below the floor mid-replace.
+- Every override is actuated through the same floor/ceiling- and drain-respecting paths as
+  the autoscaler and is written to the action history with `actor=manual`.
+
+> ⚠️ **Floor-fill:** manually removing or replacing a Connector below `min_connectors`
+> only triggers FC to **auto-fill the Remote Network back up to the floor on the next
+> cycle**. To run the Remote Network smaller, lower `min_connectors` and restart the
+> manager instead — the floor outranks a manual scale-down.
+>
+> ⚠️ **The override secret travels in a request header in clear text.** It is a static,
+> non-expiring bearer credential (rotate it by redeploying with a new `FC_OVERRIDE_SECRET`).
+> Enable overrides only behind a TLS-terminating proxy (or over loopback), and ensure any
+> proxy in front does not log the `X-FC-Override-Secret` header. The status UI / `/metrics`
+> port binds to **`127.0.0.1` by default** in `docker-compose.yml`; public exposure is
+> opt-in and should always sit behind TLS. Reach a loopback-bound manager over an SSH tunnel
+> (`ssh -L 8080:localhost:8080 <host>`).
 
 ---
 

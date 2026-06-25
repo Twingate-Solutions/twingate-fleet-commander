@@ -8,17 +8,18 @@
 #     --scopes=cloud-platform
 #
 # Secrets: prefer fetching TWINGATE_API_KEY from Secret Manager at boot using the
-# instance's service account, rather than inlining it. TWINGATE_NETWORK / SEED_RN_ID
-# are not secret.
+# instance's service account, rather than inlining it. TWINGATE_NETWORK is not
+# secret. FC self-provisions its Connectors — set the Remote Network it manages
+# in config/config.yaml (remote_network_id), not here.
 
 write_files:
   - path: /etc/fc.env
     permissions: '0600'
     content: |
       TWINGATE_NETWORK=acme
-      SEED_RN_ID=UmVtb3RlTmV0d29yazoxMjM=
-      # Recommended: pull from Secret Manager instead of inlining.
-      # TWINGATE_API_KEY=tgp_xxxxxxxx
+      # TWINGATE_API_KEY is NOT inlined here — user-data is readable from inside
+      # the VM via the metadata server. It is fetched from Secret Manager at
+      # runcmd time (see below).
 
 runcmd:
   - [ bash, -c, "apt-get update && apt-get install -y git" ]

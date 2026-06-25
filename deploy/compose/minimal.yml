@@ -1,0 +1,44 @@
+# Fleet Commander — MINIMAL variant: just the manager.
+#
+# "Just autoscale my Remote Network; I already ship connector logs myself."
+# FC self-provisions its connectors up to `min_connectors` and scales on load —
+# there are no seed connectors and no sidecars here.
+#
+# The root ../../docker-compose.yml is the rich, fully-commented canonical
+# example (security notes, healthcheck, janus, log-shipper). This file is a thin
+# fc-only subset; read the root file for the why behind each setting.
+#
+# Run from the repo root:
+#   docker compose -f deploy/compose/minimal.yml up -d
+
+services:
+  fc:
+    build: ../..
+    image: fleet-commander:dev
+    container_name: fc
+    restart: unless-stopped
+    env_file: ../../.env
+    volumes:
+      # Root-equivalent: required so the actuator can run/stop/rm connectors.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../../config/config.yaml:/app/config/config.yaml:ro
+      - fc_state:/app/state
+    ports:
+      # Loopback by default; expose publicly only behind a TLS proxy.
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz', timeout=3).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  fc_state:

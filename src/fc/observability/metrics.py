@@ -22,7 +22,41 @@ from prometheus_client import (
     generate_latest,
 )
 
-from fc.models import ManagedConnector
+from fc.models import ConnectorState, ManagedConnector
+
+#: The bounded set of ``reason_class`` values used as a metric label. Never a
+#: free-text string — the cardinality of ``fc_health_actions_total`` must stay
+#: fixed so a customer's Prometheus does not suffer a label explosion.
+HealthReasonClass = str
+
+_DEAD_REASON_CLASSES: dict[ConnectorState, str] = {
+    ConnectorState.DEAD_NO_RELAYS: "dead_no_relays",
+    ConnectorState.DEAD_NO_HEARTBEAT: "dead_no_heartbeat",
+    ConnectorState.DEAD_HEARTBEAT_TOO_OLD: "dead_heartbeat_too_old",
+}
+
+
+def classify_health_reason(connector: ManagedConnector) -> HealthReasonClass:
+    """Classify a Connector's unhealth into a bounded ``reason_class`` label.
+
+    The Twingate-reported ``DEAD_*`` state takes precedence over Docker health:
+    a Connector that Twingate marks dead is classified by that state even if its
+    Docker health is also ``unhealthy``. The mapping is total and never returns
+    free text, so it is safe as a Prometheus label value.
+
+    Args:
+        connector: The Connector a health action is being taken on.
+
+    Returns:
+        One of ``dead_no_relays``, ``dead_no_heartbeat``,
+        ``dead_heartbeat_too_old``, ``docker_unhealthy``, or the ``unknown``
+        fallback.
+    """
+    if connector.twingate_state is not None and connector.twingate_state in _DEAD_REASON_CLASSES:
+        return _DEAD_REASON_CLASSES[connector.twingate_state]
+    if connector.docker_health == "unhealthy":
+        return "docker_unhealthy"
+    return "unknown"
 
 
 class Metrics:
@@ -76,6 +110,12 @@ class Metrics:
             "fc_replacements",
             "Total Connector replacements, by Remote Network.",
             ["rn"],
+            registry=self.registry,
+        )
+        self.health_actions = Counter(
+            "fc_health_actions",
+            "Total health-remediation actions, by action kind and bounded reason class.",
+            ["kind", "reason_class"],
             registry=self.registry,
         )
         self.seconds_since_last_action = Gauge(

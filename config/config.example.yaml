@@ -1,45 +1,105 @@
 # Fleet Commander — non-secret policy configuration.
 # Copy to config/config.yaml. Secrets belong in .env, never here.
+#
+# Fleet Commander manages exactly ONE Remote Network (Key Design Rule N1).
+#
+# Every key below can also be overridden by an environment variable, with
+# precedence: env  >  this YAML  >  built-in default. The env name is the key
+# path under the prefix FC_POLICY__, joined by double underscores, e.g.:
+#   FC_POLICY__MIN_CONNECTORS=4
+#   FC_POLICY__SCALE_METRICS__CPU__HIGH_PCT=90
+#   FC_POLICY__SCALE_METRICS__THROUGHPUT__WINDOW_SECONDS=1800
 
 poll_interval_seconds: 30
-connector_image: "twingate/connector:1"   # image used when provisioning
-metrics_port: 9999                          # connector :9999 scrape port
+
+# Image FC provisions for every connector it runs. THE DEFAULT is the custom
+# image, which emits rich per-connector tunnel metrics on stdout (consumed by the
+# stdout_metrics collector below):
+connector_image: "ghcr.io/twingate-solutions/twingate-custom-connector-container:latest"
+# BACKUP: the official image works too, but emits no stdout metrics — set
+# stdout_metrics:false and rely on docker_stats (CPU + NIC-delta throughput):
+#   connector_image: "twingate/connector:1"
 
 collectors:
-  docker_stats: true        # default; works on any image
-  stdout_metrics: false     # custom image only; opt-in
-  prometheus: true          # primary throughput signal
+  # With the custom image (the default), stdout_metrics is the primary signal
+  # (true tunnel throughput); docker_stats stays on as the universal fallback.
+  # With the official image as a backup, set stdout_metrics:false.
+  docker_stats: true        # universal CPU + NIC-delta throughput fallback (any image)
+  stdout_metrics: true      # primary tunnel throughput from the custom image's stdout
 
 labels:                     # Docker labels FC sets/reads to identify managed connectors
   managed: "twingate.fc.managed"
   remote_network: "twingate.fc.rn"
   connector_id: "twingate.fc.connector_id"
-janus_lock_label: "twingate.janus.upgrading"   # if present on a container, FC yields
 
-defaults:                   # applied to every Remote Network unless overridden below
-  min_connectors: 2         # hard floor — never breached by scale-down
-  max_connectors: 6
-  scale_step: 1
-  cpu_high_pct: 75          # normalized (avg core utilization)
-  cpu_low_pct: 25
-  throughput_high_mbps: 80  # per-connector tunnel throughput
-  throughput_low_mbps: 10
-  mem_ceiling_bytes: 0      # 0 = advisory only (no mem-based action)
-  scale_up_window_seconds: 300      # short — react fast
-  scale_down_window_seconds: 1200   # long — react slowly
-  scale_up_cooldown_seconds: 600
-  scale_down_cooldown_seconds: 1800
-  drain_grace_seconds: 120          # wait after connectorDelete before stop/rm
-  max_restarts: 3                   # within restart_window before replace
-  restart_window_seconds: 600
-  startup_grace_seconds: 90         # don't restart a just-provisioned connector
-                                    # before its first heartbeat (0 disables)
+# Janus auto-update enrolment. Janus (the connector version-updater sidecar) has
+# NO lock — it upgrades a container whenever a newer image is published. FC does
+# not coordinate via a lock; when enabled it simply stamps janus's auto-update
+# labels on every connector it provisions and tolerates the brief recreate a
+# janus upgrade causes via the startup-grace / unhealthy-threshold windows.
+janus:
+  enabled: true             # stamp janus.autoupdate.enable + .interval on provision
+  interval_seconds: 86400   # value for the janus.autoupdate.interval label (1 day)
 
-remote_networks:            # per-RN overrides (inherit from defaults)
-  - id: "UmVtb3RlTmV0d29yazoxMjM="
-    name: "aws-prod"
-    min_connectors: 3
-    max_connectors: 10
-  - id: "UmVtb3RlTmV0d29yazo0NTY="
-    name: "office"
-    # inherits all defaults
+# The single managed Remote Network.
+remote_network_id: "UmVtb3RlTmV0d29yazoxMjM="
+remote_network_name: "aws-prod"             # optional, for display only
+
+# Scaling bounds and step.
+min_connectors: 2           # hard floor — never breached by scale-down
+max_connectors: 6
+scale_step: 1
+
+# Per-metric scale triggers. Each metric is reduced over its own trailing
+# window using its own aggregation mode (avg | min | pNN, e.g. p95) before being
+# compared to the high/low watermarks. The same windowed value drives both
+# scale-up (high) and scale-down (low) for that metric; pick a short window for a
+# fast-reacting signal and a longer one for a slow signal.
+scale_metrics:
+  cpu:                      # normalized per-effective-core utilization
+    high_pct: 75            #   (% of the provisioned 2-vCPU limit)
+    low_pct: 25
+    window_seconds: 300     # short — CPU reacts fast
+    agg: avg
+  throughput:               # per-connector tunnel throughput
+    high_mbps: 80
+    low_mbps: 10
+    window_seconds: 1200    # long — throughput reacts slowly
+    agg: avg
+
+# Scale-UP trigger: how per-connector high-watermark crossings combine into a
+# single fleet scale-up decision (the "sticky-connector" problem). One hot
+# connector is often a load-balancing issue, not a capacity one — adding a
+# connector won't help if clients stay pinned to the hot one — so the default
+# is quorum, not any.
+#   any    — scale up if ANY single connector is over its high watermark
+#            (most aggressive; reacts to one hot connector)
+#   mean   — scale up on the FLEET-AVERAGE windowed signal (one hot connector
+#            can be diluted by quiet ones; this is the legacy behavior)
+#   quorum — scale up only when a fraction of connectors are hot (the default)
+# Watch the connectors_over_high_watermark and hot_connector_max values in the
+# decide.* logs/metrics and tune over time. Scale-DOWN is unaffected — it stays
+# conservative (every present signal at/below its low watermark).
+scale_up_trigger: quorum          # any | mean | quorum
+quorum_fraction: 0.5              # fraction of connectors that must be hot under
+                                  # quorum; threshold = max(1, ceil(frac * count))
+
+# Cooldowns, drain, and health.
+scale_up_cooldown_seconds: 600
+scale_down_cooldown_seconds: 1800
+drain_grace_seconds: 120          # wait after connectorDelete before stop/rm
+max_restarts: 3                   # within restart_window before replace
+restart_window_seconds: 600       # rolling window over action history for the
+                                  # restart count that gates escalation to replace
+startup_grace_seconds: 90         # don't restart a just-provisioned connector
+                                  # before its first heartbeat (0 disables)
+unhealthy_threshold_seconds: 60   # must be continuously unhealthy this long
+                                  # before any restart/replace fires (0 disables)
+replace_health_timeout_seconds: 300  # wait-for-healthy bound on a net-new
+                                  # replace before alerting; old connector is
+                                  # never torn down until the replacement is healthy
+
+# NOTE: provisioned connectors always get the prescribed 1 vCPU / 2 GB resource
+# limits (Key Design Rule N2) — there is no mem-ceiling knob. The connector data
+# path is single-threaded, so CPU watermarks above are a percentage of that one
+# core (a saturated connector reads ~100%); FC scales out horizontally.

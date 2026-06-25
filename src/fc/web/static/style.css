@@ -40,6 +40,16 @@ main { padding: 22px; max-width: 1200px; margin: 0 auto; }
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
 .hidden { display: none !important; }
+.warn {
+  color: var(--warn);
+  border-left: 3px solid var(--warn);
+  padding-left: 10px;
+  margin: 8px 0 0;
+}
+.warn code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--text);
+}
 
 .badge {
   background: var(--accent);

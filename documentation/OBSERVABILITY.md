@@ -39,27 +39,38 @@ Source: `src/fc/observability/events.py`. Every `event` field value in a FC log 
 
 The absence of `loop.cycle.complete` lines is the primary indicator of a stuck or crashed manager. The `loop.rn.error` event signals per-RN isolation: one bad Remote Network never aborts the whole cycle.
 
+The control loop also emits paired `*.start` / `*.complete` events at **debug** level around each phase (discover, collect, decide, health), so a `FC_LOG_LEVEL=debug` run shows the full cycle timeline. They carry only `cycle_id` (plus the noted counters) and are omitted at the default `info` level.
+
 #### Discovery
 
 | Constant | Value | Level | Emitted when | Key fields |
 |---|---|---|---|---|
+| `DISCOVER_START` | `discover.start` | debug | The discovery phase begins | `cycle_id` |
 | `DISCOVER_RESULT` | `discover.result` | info | Fleet discovery finishes | `fleet_size`, `per_rn` (counts per RN) |
+| `DISCOVER_COMPLETE` | `discover.complete` | debug | The discovery phase finishes | `fleet_size` |
 
 #### Collection
 
 | Constant | Value | Level | Emitted when | Key fields |
 |---|---|---|---|---|
+| `COLLECT_START` | `collect.start` | debug | The collection phase begins | `cycle_id` |
 | `COLLECT_SAMPLE` | `collect.sample` | debug | A single resource sample was taken | `connector_id`, `source` |
 | `COLLECT_ERROR` | `collect.error` | warning | A collector failed for one Connector (isolated; cycle continues) | `connector_id`, `source`, `error` |
+| `COLLECT_COMPLETE` | `collect.complete` | debug | The collection phase finishes | `sample_count` |
+| `<collector>.schema_drift` | e.g. `stdout_metrics.schema_drift` | warning | A `[metrics]` line parsed but carried **no** known schema field — the custom image's metrics schema has drifted and the collector is silently yielding no usable sample. Emitted once per collector (`stdout_metrics`, `cloudwatch_logs`, `azure_logs`) | `connector_id`, `keys` |
 
 #### Decision
 
 | Constant | Value | Level | Emitted when | Key fields |
 |---|---|---|---|---|
+| `DECIDE_START` | `decide.start` | debug | The scale-decision phase begins | `cycle_id` |
+| `DECIDE_COMPLETE` | `decide.complete` | debug | The scale-decision phase finishes | `direction` |
 | `DECIDE_SCALE_UP` | `decide.scale_up` | info | A scale-up is decided for a Remote Network | `rn_id`, `count`, `reason`, `metrics` |
 | `DECIDE_SCALE_DOWN` | `decide.scale_down` | info | A scale-down is decided | `rn_id`, `count`, `reason`, `metrics` |
-| `DECIDE_NO_ACTION` | `decide.no_action` | info | Steady state — no scaling action this cycle for the RN | `rn_id`, `reason` |
-| `DECIDE_COOLDOWN_SKIP` | `decide.cooldown_skip` | info | A valid scaling action was suppressed by an active cooldown | `rn_id`, `seconds_remaining`, `reason` |
+| `DECIDE_NO_ACTION` | `decide.no_action` | info | Steady state — no scaling action this cycle for the RN | `rn_id`, `reason`, `metrics` |
+| `DECIDE_COOLDOWN_SKIP` | `decide.cooldown_skip` | info | A valid scaling action was suppressed by an active cooldown | `rn_id`, `seconds_remaining`, `reason`, `metrics` |
+
+The `metrics` dict on every `decide.*` line carries the triggering windowed aggregates plus the sticky-connector signal: `connectors_over_high_watermark` (how many Connectors are individually over a high watermark this cycle), `hot_connector_max` (the hottest per-connector windowed CPU, present when any Connector reported CPU), and — in `quorum` mode — `quorum_threshold` (the integer count that had to be hot). See [CONFIGURATION.md](CONFIGURATION.md) → *Scale-up trigger* for how these combine.
 
 #### Actions
 
@@ -71,22 +82,26 @@ The absence of `loop.cycle.complete` lines is the primary indicator of a stuck o
 | `ACTION_DEPROVISION_START` | `action.deprovision.start` | info | Drain + remove began | `rn_id`, `connector_id`, `drain_grace`, `actor` |
 | `ACTION_DEPROVISION_SUCCESS` | `action.deprovision.success` | info | Connector drained and removed | `rn_id`, `connector_id`, `actor` |
 | `ACTION_DEPROVISION_FAIL` | `action.deprovision.fail` | error | Deprovisioning failed | `rn_id`, `connector_id`, `error`, `actor` |
-| `ACTION_RESTART` | `action.restart` | info | Connector restarted in place | `rn_id`, `connector_id`, `restart_count` |
-| `ACTION_REPLACE` | `action.replace` | info | Connector replaced after repeated restart failures | `rn_id`, `old_connector_id`, `new_connector_id`, `old_removed` |
+| `ACTION_RESTART` | `action.restart` | info | Connector restarted in place | `rn_id`, `connector_id`, `restart_count`, `reason`, `state`, `sample` |
+| `ACTION_REPLACE` | `action.replace` | info | Connector replaced after repeated restart failures (logged when the wait-for-healthy replace completes) | `rn_id`, `old_connector_id`, `new_connector_id`, `old_removed`, `reason` |
 | `ACTION_CORDON` | `action.cordon` | info | Connector cordoned or un-cordoned via manual override | `connector_id`, `cordoned`, `actor=manual`, `rn_id` |
+
+The `action.restart` and `health.replace_pending` lines carry `reason` (the decider's remediation reason, e.g. `DEAD_NO_RELAYS; restart 2/3`), `state` (the Twingate state at the time, or `null`), and a bounded, secret-free `sample` object — `{cpu_pct_norm, throughput_bps, mem_bytes, source}` from the Connector's latest sample this cycle, or `null` if none — so the triggering signal travels with the action. The field set is fixed, so log cardinality stays bounded. `action.replace` carries the stored `reason` from when the replace was started.
 
 #### Health
 
 | Constant | Value | Level | Emitted when | Key fields |
 |---|---|---|---|---|
+| `HEALTH_START` | `health.start` | debug | The health-remediation phase begins | `cycle_id` |
+| `HEALTH_COMPLETE` | `health.complete` | debug | The health-remediation phase finishes | `action_count` |
 | `HEALTH_CONNECTOR_DEAD` | `health.connector_dead` | warning | Twingate reports a Connector in a `DEAD_*` state | `connector_id`, `state` |
-| `HEALTH_UNHEALTHY` | `health.unhealthy` | warning | Connector's Docker health is `unhealthy` | `connector_id` |
+| `HEALTH_UNHEALTHY` | `health.unhealthy` | warning | Connector's Docker health is `unhealthy` | `connector_id`, `failing_streak` |
+| `HEALTH_REPLACE_PENDING` | `health.replace_pending` | info | A net-new replacement was provisioned; FC is waiting for it to report `ALIVE`/healthy before draining the old Connector (the teardown happens on a later cycle — Rule #4) | `rn_id`, `old_connector_id`, `new_connector_id`, `reason`, `state`, `sample` |
+| `HEALTH_REPLACE_TIMEOUT` | `health.replace_timeout` | warning | A pending replacement did not become healthy within `replace_health_timeout_seconds`; the failed (never-healthy) replacement is torn down and the old traffic-serving Connector is left in place to retry next cycle. **Alertable.** | `rn_id`, `old_connector_id`, `new_connector_id`, `waited_s` |
 
 #### Janus
 
-| Constant | Value | Level | Emitted when | Key fields |
-|---|---|---|---|---|
-| `JANUS_LOCK_ENGAGED` | `janus.lock_engaged` | info | A Connector was skipped because the janus upgrade lock is set | `connector_id` |
+FC emits no dedicated janus event. Janus has **no lock mechanism** (Key Design Rule #5): FC neither coordinates with it nor skips Connectors for it. Instead, FC *enrols* every Connector it provisions by stamping the janus auto-update labels (`janus.autoupdate.enable=true` + `janus.autoupdate.interval=<seconds>`) at provision time — visible on the `action.provision.success` line and on the container itself — and *absorbs* the brief upgrade-recreate via the `startup_grace_seconds` / `unhealthy_threshold_seconds` windows. See [CONFIGURATION.md](CONFIGURATION.md) → *Janus enrolment*.
 
 #### Config and external-dependency errors
 
@@ -112,10 +127,11 @@ The registry is private (not the global prometheus_client default), so construct
 | `fc_scale_actions_total` | Counter | `rn`, `direction` | Scale actions that succeeded (`direction` is `up` or `down`). Incremented once per Connector provisioned or deprovisioned. |
 | `fc_restarts_total` | Counter | `rn` | Successful in-place Connector restarts, by Remote Network. |
 | `fc_replacements_total` | Counter | `rn` | Successful full replacements (new provisioned and old removed), by Remote Network. An incomplete replace (new provisioned but old not removed) is not counted. |
+| `fc_health_actions_total` | Counter | `kind`, `reason_class` | Health-remediation actions taken, by action kind and a bounded reason class. `kind` is `restart` or `replace`. `reason_class` is one of `dead_no_relays`, `dead_no_heartbeat`, `dead_heartbeat_too_old`, `docker_unhealthy`, or `unknown` — a fixed, bounded set (never free text) so the series cannot suffer a label explosion. The Twingate `DEAD_*` state takes precedence over Docker health when classifying. |
 | `fc_seconds_since_last_action` | Gauge | `rn` | Seconds since the most recent scale action (up or down) in a Remote Network. Derived from the SQLite cooldown timestamps; unset for RNs with no recorded action. |
 | `fc_twingate_api_errors_total` | Counter | — | Total Twingate Admin API call failures across all operations. |
-| `fc_docker_api_errors_total` | Counter | — | Total Docker API call failures. |
-| `fc_collect_errors_total` | Counter | `collector` | Collector failures, by collector source name (`docker_stats`, `stdout_metrics`, `prometheus`). |
+| `fc_docker_api_errors_total` | Counter | — | Total **actuator-backend** API call failures. Despite the `docker` in the name (retained for dashboard compatibility), this counts failures from whichever backend is active — Docker, ECS, or ACI — since all three raise a common `ActuatorError`. |
+| `fc_collect_errors_total` | Counter | `collector` | Collector failures, by collector source name (`docker_stats`, `stdout_metrics` on Docker; `cloudwatch_logs` on ECS; `azure_logs` on ACI). |
 
 ### HTTP endpoints
 

@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`fc.config` — Settings, Policy tree, and the loader."""
+"""Unit tests for :mod:`fc.config` — Settings, the flat Policy, and the loader."""
 
 from pathlib import Path
 
@@ -7,7 +7,6 @@ import pytest
 from fc.config import (
     ConfigError,
     Policy,
-    ResolvedRemoteNetwork,
     Settings,
     load_policy,
 )
@@ -15,43 +14,44 @@ from fc.config import (
 GOOD_YAML = """
 poll_interval_seconds: 30
 connector_image: "twingate/connector:1"
-metrics_port: 9999
 
 collectors:
   docker_stats: true
   stdout_metrics: false
-  prometheus: true
 
 labels:
   managed: "twingate.fc.managed"
   remote_network: "twingate.fc.rn"
   connector_id: "twingate.fc.connector_id"
-janus_lock_label: "twingate.janus.upgrading"
 
-defaults:
-  min_connectors: 2
-  max_connectors: 6
-  scale_step: 1
-  cpu_high_pct: 75
-  cpu_low_pct: 25
-  throughput_high_mbps: 80
-  throughput_low_mbps: 10
-  mem_ceiling_bytes: 0
-  scale_up_window_seconds: 300
-  scale_down_window_seconds: 1200
-  scale_up_cooldown_seconds: 600
-  scale_down_cooldown_seconds: 1800
-  drain_grace_seconds: 120
-  max_restarts: 3
-  restart_window_seconds: 600
+janus:
+  enabled: true
+  interval_seconds: 86400
 
-remote_networks:
-  - id: "rn-aws"
-    name: "aws-prod"
-    min_connectors: 3
-    max_connectors: 10
-  - id: "rn-office"
-    name: "office"
+remote_network_id: "rn-aws"
+remote_network_name: "aws-prod"
+
+min_connectors: 2
+max_connectors: 6
+scale_step: 1
+
+scale_metrics:
+  cpu:
+    high_pct: 75
+    low_pct: 25
+    window_seconds: 300
+    agg: avg
+  throughput:
+    high_mbps: 80
+    low_mbps: 10
+    window_seconds: 1200
+    agg: avg
+
+scale_up_cooldown_seconds: 600
+scale_down_cooldown_seconds: 1800
+drain_grace_seconds: 120
+max_restarts: 3
+restart_window_seconds: 600
 """
 
 
@@ -63,21 +63,33 @@ def _write(tmp_path: Path, content: str) -> Path:
 
 
 # --------------------------------------------------------------------------
-# Policy loading + resolution
+# Policy loading (flat, single-RN)
 # --------------------------------------------------------------------------
 
 
 def test_load_good_policy(tmp_path: Path) -> None:
-    """A well-formed YAML loads into a Policy with the expected shape."""
+    """A well-formed flat YAML loads into a Policy with the expected shape."""
     policy = load_policy(_write(tmp_path, GOOD_YAML))
     assert isinstance(policy, Policy)
     assert policy.poll_interval_seconds == 30
     assert policy.connector_image == "twingate/connector:1"
-    assert policy.metrics_port == 9999
-    assert policy.collectors.prometheus is True
+    assert policy.collectors.docker_stats is True
     assert policy.collectors.stdout_metrics is False
-    assert policy.defaults.min_connectors == 2
-    assert len(policy.remote_networks) == 2
+    assert policy.remote_network_id == "rn-aws"
+    assert policy.remote_network_name == "aws-prod"
+    assert policy.min_connectors == 2
+    assert policy.max_connectors == 6
+    assert policy.scale_metrics.cpu.high_pct == 75
+    assert policy.scale_metrics.cpu.window_seconds == 300
+    assert policy.scale_metrics.throughput.window_seconds == 1200
+    assert policy.scale_metrics.throughput.agg == "avg"
+
+
+def test_remote_network_name_optional(tmp_path: Path) -> None:
+    """remote_network_name may be omitted (defaults to None)."""
+    yaml_no_name = GOOD_YAML.replace('remote_network_name: "aws-prod"\n', "")
+    policy = load_policy(_write(tmp_path, yaml_no_name))
+    assert policy.remote_network_name is None
 
 
 def test_load_repo_example_config() -> None:
@@ -86,52 +98,135 @@ def test_load_repo_example_config() -> None:
     example = repo_root / "config" / "config.example.yaml"
     policy = load_policy(example)
     assert isinstance(policy, Policy)
-    assert policy.defaults.min_connectors >= 2
+    assert policy.min_connectors >= 2
 
 
-def test_resolve_override_takes_precedence_and_inherits(tmp_path: Path) -> None:
-    """aws-prod overrides min/max but inherits cpu_high_pct from defaults."""
+# --------------------------------------------------------------------------
+# Environment overrides (env → YAML → default precedence)
+# --------------------------------------------------------------------------
+
+
+def test_env_overrides_top_level_field(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An FC_POLICY__ env var overrides the YAML value for a top-level knob."""
+    monkeypatch.setenv("FC_POLICY__MIN_CONNECTORS", "4")
     policy = load_policy(_write(tmp_path, GOOD_YAML))
-    resolved = policy.resolve_remote_network("rn-aws")
-    assert isinstance(resolved, ResolvedRemoteNetwork)
-    assert resolved.id == "rn-aws"
-    assert resolved.name == "aws-prod"
-    # Overridden:
-    assert resolved.min_connectors == 3
-    assert resolved.max_connectors == 10
-    # Inherited from defaults:
-    assert resolved.cpu_high_pct == 75
-    assert resolved.cpu_low_pct == 25
-    assert resolved.scale_up_window_seconds == 300
+    assert policy.min_connectors == 4  # env wins
+    assert policy.max_connectors == 6  # yaml retained
 
 
-def test_resolve_inherits_all_defaults(tmp_path: Path) -> None:
-    """office has no tunable overrides and inherits every default."""
+def test_env_overrides_nested_metric_field(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A nested per-metric knob is overridable; sibling YAML keys are retained."""
+    monkeypatch.setenv("FC_POLICY__SCALE_METRICS__CPU__HIGH_PCT", "90")
+    monkeypatch.setenv("FC_POLICY__SCALE_METRICS__THROUGHPUT__WINDOW_SECONDS", "1800")
     policy = load_policy(_write(tmp_path, GOOD_YAML))
-    resolved = policy.resolve_remote_network("rn-office")
-    assert resolved.id == "rn-office"
-    assert resolved.name == "office"
-    assert resolved.min_connectors == 2
-    assert resolved.max_connectors == 6
-    assert resolved.cpu_high_pct == 75
+    assert policy.scale_metrics.cpu.high_pct == 90  # env wins
+    assert policy.scale_metrics.cpu.low_pct == 25  # yaml retained (deep merge)
+    assert policy.scale_metrics.cpu.window_seconds == 300  # yaml retained
+    assert policy.scale_metrics.throughput.window_seconds == 1800  # env wins
 
 
-def test_resolve_unknown_rn_falls_back_to_defaults(tmp_path: Path) -> None:
-    """An RN id not in the config gets pure defaults, id==name==rn_id."""
+def test_no_env_uses_yaml_then_default(tmp_path: Path) -> None:
+    """With no env override, YAML wins and unspecified knobs use field defaults."""
     policy = load_policy(_write(tmp_path, GOOD_YAML))
-    resolved = policy.resolve_remote_network("rn-unknown")
-    assert resolved.id == "rn-unknown"
-    assert resolved.name == "rn-unknown"
-    assert resolved.min_connectors == policy.defaults.min_connectors
-    assert resolved.max_connectors == policy.defaults.max_connectors
+    assert policy.min_connectors == 2  # from YAML
+    assert policy.startup_grace_seconds == 90  # field default (absent from YAML)
 
 
-def test_resolved_networks_maps_configured(tmp_path: Path) -> None:
-    """resolved_networks returns one entry per configured RN, keyed by id."""
+def test_scale_up_trigger_defaults(tmp_path: Path) -> None:
+    """The sticky-connector knobs default to quorum / 0.5 when absent from YAML."""
     policy = load_policy(_write(tmp_path, GOOD_YAML))
-    resolved = policy.resolved_networks()
-    assert set(resolved) == {"rn-aws", "rn-office"}
-    assert resolved["rn-aws"].min_connectors == 3
+    assert policy.scale_up_trigger == "quorum"
+    assert policy.quorum_fraction == 0.5
+
+
+def test_scale_up_trigger_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """scale_up_trigger is overridable via an FC_POLICY__ env var."""
+    monkeypatch.setenv("FC_POLICY__SCALE_UP_TRIGGER", "any")
+    policy = load_policy(_write(tmp_path, GOOD_YAML))
+    assert policy.scale_up_trigger == "any"
+
+
+def test_quorum_fraction_from_yaml(tmp_path: Path) -> None:
+    """quorum_fraction is read from YAML when present."""
+    good = GOOD_YAML + "\nscale_up_trigger: quorum\nquorum_fraction: 0.75\n"
+    policy = load_policy(_write(tmp_path, good))
+    assert policy.quorum_fraction == 0.75
+
+
+def test_janus_block_parsed_from_yaml(tmp_path: Path) -> None:
+    """The janus enrolment block is read from YAML."""
+    policy = load_policy(_write(tmp_path, GOOD_YAML))
+    assert policy.janus.enabled is True
+    assert policy.janus.interval_seconds == 86400
+
+
+def test_janus_defaults_when_absent(tmp_path: Path) -> None:
+    """With no janus block, it defaults to enabled / 86400s (the whole block is optional)."""
+    no_janus = GOOD_YAML.replace("janus:\n  enabled: true\n  interval_seconds: 86400\n\n", "")
+    assert "janus:" not in no_janus
+    policy = load_policy(_write(tmp_path, no_janus))
+    assert policy.janus.enabled is True
+    assert policy.janus.interval_seconds == 86400
+
+
+def test_janus_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The janus block is overridable via FC_POLICY__JANUS__ env vars."""
+    monkeypatch.setenv("FC_POLICY__JANUS__ENABLED", "false")
+    monkeypatch.setenv("FC_POLICY__JANUS__INTERVAL_SECONDS", "3600")
+    policy = load_policy(_write(tmp_path, GOOD_YAML))
+    assert policy.janus.enabled is False
+    assert policy.janus.interval_seconds == 3600
+
+
+def test_invalid_scale_up_trigger_rejected(tmp_path: Path) -> None:
+    """An unrecognized scale_up_trigger value is rejected at load time."""
+    bad = GOOD_YAML + "\nscale_up_trigger: median\n"
+    with pytest.raises(ConfigError):
+        load_policy(_write(tmp_path, bad))
+
+
+def test_quorum_fraction_zero_rejected(tmp_path: Path) -> None:
+    """quorum_fraction must be > 0 (a fraction of zero connectors is meaningless)."""
+    bad = GOOD_YAML + "\nquorum_fraction: 0\n"
+    with pytest.raises(ConfigError):
+        load_policy(_write(tmp_path, bad))
+
+
+def test_quorum_fraction_above_one_rejected(tmp_path: Path) -> None:
+    """quorum_fraction must be <= 1 (a fraction over 100% is meaningless)."""
+    bad = GOOD_YAML + "\nquorum_fraction: 1.5\n"
+    with pytest.raises(ConfigError):
+        load_policy(_write(tmp_path, bad))
+
+
+def test_health_path_defaults(tmp_path: Path) -> None:
+    """The Session 12 health knobs have sensible defaults when absent from YAML."""
+    policy = load_policy(_write(tmp_path, GOOD_YAML))
+    assert policy.unhealthy_threshold_seconds == 60
+    assert policy.replace_health_timeout_seconds == 300
+
+
+def test_health_path_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The new health knobs are overridable via FC_POLICY__ env vars."""
+    monkeypatch.setenv("FC_POLICY__UNHEALTHY_THRESHOLD_SECONDS", "0")
+    monkeypatch.setenv("FC_POLICY__REPLACE_HEALTH_TIMEOUT_SECONDS", "120")
+    policy = load_policy(_write(tmp_path, GOOD_YAML))
+    assert policy.unhealthy_threshold_seconds == 0
+    assert policy.replace_health_timeout_seconds == 120
+
+
+def test_replace_health_timeout_zero_rejected(tmp_path: Path) -> None:
+    """replace_health_timeout_seconds must be >= 1 (a real bound on the wait)."""
+    bad = GOOD_YAML + "\nreplace_health_timeout_seconds: 0\n"
+    with pytest.raises(ConfigError):
+        load_policy(_write(tmp_path, bad))
+
+
+def test_env_override_still_validated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An env override that breaches an invariant fails fast like a bad YAML."""
+    monkeypatch.setenv("FC_POLICY__MIN_CONNECTORS", "1")  # below the hard floor
+    with pytest.raises(ConfigError):
+        load_policy(_write(tmp_path, GOOD_YAML))
 
 
 # --------------------------------------------------------------------------
@@ -146,16 +241,9 @@ def test_unknown_key_rejected(tmp_path: Path) -> None:
         load_policy(_write(tmp_path, bad))
 
 
-def test_min_connectors_below_floor_rejected_in_defaults(tmp_path: Path) -> None:
-    """defaults.min_connectors: 1 is below the hard floor and is rejected."""
+def test_min_connectors_below_floor_rejected(tmp_path: Path) -> None:
+    """min_connectors: 1 is below the hard floor and is rejected."""
     bad = GOOD_YAML.replace("min_connectors: 2", "min_connectors: 1")
-    with pytest.raises(ConfigError):
-        load_policy(_write(tmp_path, bad))
-
-
-def test_override_min_connectors_below_floor_rejected(tmp_path: Path) -> None:
-    """An override setting min_connectors below 2 is rejected at load time."""
-    bad = GOOD_YAML.replace("min_connectors: 3", "min_connectors: 1")
     with pytest.raises(ConfigError):
         load_policy(_write(tmp_path, bad))
 
@@ -170,8 +258,42 @@ def test_max_less_than_min_rejected(tmp_path: Path) -> None:
 
 
 def test_cpu_high_not_above_low_rejected(tmp_path: Path) -> None:
-    """cpu_high_pct must be strictly greater than cpu_low_pct."""
-    bad = GOOD_YAML.replace("cpu_high_pct: 75", "cpu_high_pct: 25")
+    """cpu high_pct must be strictly greater than low_pct."""
+    bad = GOOD_YAML.replace("high_pct: 75", "high_pct: 25")
+    with pytest.raises(ConfigError):
+        load_policy(_write(tmp_path, bad))
+
+
+def test_throughput_high_not_above_low_rejected(tmp_path: Path) -> None:
+    """throughput high_mbps must be strictly greater than low_mbps."""
+    bad = GOOD_YAML.replace("high_mbps: 80", "high_mbps: 5")
+    with pytest.raises(ConfigError):
+        load_policy(_write(tmp_path, bad))
+
+
+def test_bad_agg_mode_rejected(tmp_path: Path) -> None:
+    """An unrecognized aggregation mode is rejected at load time."""
+    bad = GOOD_YAML.replace("agg: avg", "agg: median", 1)
+    with pytest.raises(ConfigError):
+        load_policy(_write(tmp_path, bad))
+
+
+def test_percentile_agg_accepted(tmp_path: Path) -> None:
+    """A pNN aggregation mode is accepted (throughput → p95, cpu stays avg)."""
+    good = GOOD_YAML.replace(
+        "    high_mbps: 80\n    low_mbps: 10\n    window_seconds: 1200\n    agg: avg",
+        "    high_mbps: 80\n    low_mbps: 10\n    window_seconds: 1200\n    agg: p95",
+    )
+    policy = load_policy(_write(tmp_path, good))
+    assert policy.scale_metrics.throughput.agg == "p95"
+
+
+def test_out_of_range_percentile_rejected(tmp_path: Path) -> None:
+    """A percentile above 100 is rejected."""
+    bad = GOOD_YAML.replace(
+        "    window_seconds: 300\n    agg: avg",
+        "    window_seconds: 300\n    agg: p150",
+    )
     with pytest.raises(ConfigError):
         load_policy(_write(tmp_path, bad))
 
@@ -180,23 +302,6 @@ def test_max_restarts_zero_rejected(tmp_path: Path) -> None:
     """max_restarts must be >= 1 so an unhealthy Connector is always restarted
     at least once before a replace (Key Design Rule #4 'restart first')."""
     bad = GOOD_YAML.replace("max_restarts: 3", "max_restarts: 0")
-    with pytest.raises(ConfigError):
-        load_policy(_write(tmp_path, bad))
-
-
-def test_override_jointly_violating_invariant_rejected_at_load(tmp_path: Path) -> None:
-    """An override whose tunables are each individually valid but jointly
-    breach an invariant after merging onto the defaults fails fast at load
-    time (not lazily mid-cycle): override max_connectors (2) < defaults
-    min_connectors (4)."""
-    bad = GOOD_YAML.replace("min_connectors: 2", "min_connectors: 4").replace(
-        "max_connectors: 6", "max_connectors: 8"
-    )
-    # rn-aws override: drop its own min/max overrides, set only max_connectors: 2.
-    bad = bad.replace(
-        '  - id: "rn-aws"\n    name: "aws-prod"\n    min_connectors: 3\n    max_connectors: 10',
-        '  - id: "rn-aws"\n    name: "aws-prod"\n    max_connectors: 2',
-    )
     with pytest.raises(ConfigError):
         load_policy(_write(tmp_path, bad))
 

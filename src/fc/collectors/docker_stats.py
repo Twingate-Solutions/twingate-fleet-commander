@@ -10,8 +10,9 @@ emits. Each cycle it takes a single-shot ``stats`` reading and computes:
 * **memory** — usage bytes and percent (percent is ``None`` when the stats
   payload carries no limit; see Key Design Rule #8).
 * **throughput** — a NIC-level bytes/sec fallback from the change in summed
-  ``rx_bytes``/``tx_bytes``. This is the fallback signal; ``prometheus`` is the
-  primary, tunnel-level throughput source.
+  ``rx_bytes``/``tx_bytes``. This is the universal fallback signal;
+  ``stdout_metrics`` is the primary, tunnel-level throughput source on the
+  custom connector image.
 
 Because deltas are computed cycle-over-cycle, the very first reading for a
 container yields ``None`` CPU and throughput (no prior snapshot) while still

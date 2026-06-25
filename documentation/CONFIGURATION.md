@@ -38,26 +38,44 @@ Source: `src/fc/config.py:Policy`, loaded by `load_policy(FC_CONFIG_PATH)`. See 
 
 Unknown keys at any level are rejected (`extra="forbid"`) so a typo in the YAML fails fast at startup rather than being silently ignored.
 
+**One FC instance manages exactly one Remote Network (Key Design Rule N1).** The policy is therefore a single **flat** model carrying that Remote Network's id directly — there is no `defaults` block and no `remote_networks[]` list, and there is no per-RN merge/override resolution. To manage more Remote Networks, run more FC instances.
+
+**Every policy knob is environment-overridable.** Each field can be set via an `FC_POLICY__<FIELD>` environment variable (nested fields use `__`, e.g. `FC_POLICY__SCALE_METRICS__CPU__HIGH_PCT`). Precedence is **env → YAML → field default**: an env var wins over the YAML file, which wins over the model's built-in default. This makes it possible to twist one knob in `docker-compose` without editing the mounted file.
+
 ### Top-level keys
 
-| Key | Type | Description |
-|---|---|---|
-| `poll_interval_seconds` | `int >= 1` | How often the control loop runs one full cycle. |
-| `connector_image` | `str` | Docker image used when provisioning new Connectors (e.g. `twingate/connector:1`). |
-| `metrics_port` | `int` (1–65535) | The port on each Connector container that exposes the Prometheus metrics endpoint (default in the example: `9999`). |
-| `collectors` | object | Enable/disable flags for each signal collector. See below. |
-| `labels` | object | Docker label keys FC sets and reads to identify managed Connectors. See below. |
-| `janus_lock_label` | `str` | Docker label key whose presence on a container signals a janus upgrade in progress. FC skips all scale and health actions on a locked Connector. |
-| `defaults` | object | Default tunable values applied to every Remote Network unless overridden. See below. |
-| `remote_networks` | `list` | Optional per-RN override blocks. Any key omitted inherits from `defaults`. See below. |
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `remote_network_id` | `str` | — **(required)** | The base64 id of the single Remote Network this FC instance manages (from the Twingate Admin API). |
+| `remote_network_name` | `str \| None` | `None` | Optional human-friendly name for the managed Remote Network (display only). |
+| `poll_interval_seconds` | `int >= 1` | — | How often the control loop runs one full cycle. |
+| `connector_image` | `str` | — | Docker image used when provisioning new Connectors. |
+| `min_connectors` | `int >= 2` | — | Hard redundancy floor. Scale-down never reduces the Remote Network below this count. Cannot be set below 2. |
+| `max_connectors` | `int >= 2`, `>= min_connectors` | — | Scale-up ceiling. Provisioning stops when the count reaches this value. |
+| `scale_step` | `int >= 1` | — | Number of Connectors to add or remove per scale action. |
+| `scale_metrics` | object | — | Per-metric scale triggers (CPU + throughput). See below. |
+| `scale_up_trigger` | `"any" \| "mean" \| "quorum"` | `quorum` | How per-connector high-watermark crossings combine into one fleet scale-up decision. See *Scale-up trigger* below. |
+| `quorum_fraction` | `float`, `0 < x <= 1` | `0.5` | Fraction of Connectors that must be over a high watermark under `quorum` mode; the integer threshold is `max(1, ceil(quorum_fraction * current_count))`. |
+| `scale_up_cooldown_seconds` | `int >= 0` | — | Minimum elapsed time between two consecutive scale-up actions. Persisted in SQLite so a manager restart cannot reset it. |
+| `scale_down_cooldown_seconds` | `int >= 0` | — | Minimum elapsed time between two consecutive scale-down actions. |
+| `drain_grace_seconds` | `int >= 0` | — | Seconds to wait after `connectorDelete` (which stops the controller routing new connections) before stopping and removing the container. |
+| `max_restarts` | `int >= 1` | — | Maximum in-place restarts of a Connector within `restart_window_seconds` before the decider escalates from restart to replace. |
+| `restart_window_seconds` | `int >= 1` | — | Rolling window over which restart counts are evaluated for restart-before-replace escalation. The effective window is printed in the replace `reason` string. |
+| `startup_grace_seconds` | `int >= 0` | `90` | Grace window after FC first sees a Connector before a *never-heartbeated* `DEAD_NO_HEARTBEAT` Connector is treated as dead, so a freshly provisioned Connector is not restarted before its first heartbeat registers. `0` disables grace. |
+| `unhealthy_threshold_seconds` | `int >= 0` | `60` | A Connector must be *continuously* unhealthy for at least this long before any health remediation (restart/replace) fires, so a brief blip never triggers an action. The timer resets the moment the Connector recovers. `0` disables the gate (act on the first unhealthy observation). |
+| `replace_health_timeout_seconds` | `int >= 1` | `300` | Bound on the cycle-spanning wait-for-healthy replace: after the replacement is provisioned, FC waits up to this long for it to report `ALIVE`/healthy before giving up on that attempt. On timeout the failed replacement is torn down and the old Connector is left in place to retry next cycle. |
+| `collectors` | object | — | Enable/disable flags for each signal collector. See below. |
+| `labels` | object | — | Docker label keys FC sets and reads to identify managed Connectors. See below. |
+| `janus` | object | (enabled) | Janus auto-update enrolment for provisioned Connectors. See *Janus enrolment* below. |
+
+> **Container resource limits are not configurable (Key Design Rule N2).** Every provisioned Connector is given the prescribed per-connector limits — **1 vCPU / 2 GB** — hard-coded by the actuator (Docker `NanoCpus` + `Memory`; ECS `cpu=1024`/`memory=2048`; ACI `1.0` core / `2.0` GB). The Connector data path is effectively single-threaded, so a 1-vCPU limit lets a saturated Connector read ~100% normalized CPU (against two cores it would top out near ~50% and the watermark could never fire) — FC scales horizontally instead. The CPU watermark (`scale_metrics.cpu.high_pct` / `low_pct`) is therefore a percentage of that one effective core. There is no `mem_ceiling_bytes` knob; memory is advisory only and never a scale trigger.
 
 ### `collectors`
 
 | Key | Type | Description |
 |---|---|---|
-| `docker_stats` | `bool` | Collect CPU (normalized) and memory via the Docker stats API. Works with any Connector image. |
-| `stdout_metrics` | `bool` | Parse CPU and memory from the Connector's stdout (custom image only). Opt-in; disabled by default in the example config. |
-| `prometheus` | `bool` | Scrape tunnel throughput (bytes/sec) from `:<metrics_port>/metrics` on each Connector container. Primary throughput signal. |
+| `docker_stats` | `bool` | Collect CPU (normalized), memory, and a NIC-delta throughput fallback via the Docker stats API. Works with any Connector image — the universal source. |
+| `stdout_metrics` | `bool` | Parse CPU, memory, and tunnel throughput from the Connector's stdout (custom image only). The primary throughput signal when available. Opt-in; disabled by default in the example config. |
 
 ### `labels`
 
@@ -67,69 +85,94 @@ Unknown keys at any level are rejected (`extra="forbid"`) so a typo in the YAML 
 | `remote_network` | `str` | Label key FC sets to record the Remote Network id on a container (e.g. `twingate.fc.rn`). |
 | `connector_id` | `str` | Label key FC sets to record the logical Twingate Connector id on a container (e.g. `twingate.fc.connector_id`). Used as the join key back to the Twingate API. |
 
-### `defaults` — tunable fields
+### `janus` — janus enrolment
 
-Applied to every Remote Network unless a `remote_networks` override provides a non-`null` value for a field.
+janus (the connector version-updater sidecar) has **no lock mechanism** — it upgrades a container whenever a newer image is published (Key Design Rule #5). FC does **not** coordinate with janus via a lock or skip Connectors for it. Instead, when janus is enabled, FC *enrols* every Connector it provisions by stamping the janus auto-update labels on it, and *absorbs* the brief container recreate a janus upgrade causes via the `startup_grace_seconds` and `unhealthy_threshold_seconds` windows.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | `bool` | `true` | When `true`, stamp `janus.autoupdate.enable=true` and `janus.autoupdate.interval=<interval_seconds>` on every provisioned Connector (alongside the `twingate.fc.*` labels). When `false`, no janus labels are stamped. |
+| `interval_seconds` | `int >= 1` | `86400` | The auto-update interval (seconds) written into the `janus.autoupdate.interval` label. |
+
+Both fields are env-overridable via `FC_POLICY__JANUS__ENABLED` / `FC_POLICY__JANUS__INTERVAL_SECONDS`.
+
+### `scale_metrics` — per-metric scale triggers
+
+Each scale metric carries its own watermarks, **its own sustained window**, and **its own time-aggregation mode**, so CPU can react on a short window while throughput reacts on a longer one (Key Design Rule #3, expressed per-metric). There is **one window per metric**, and that same windowed value drives *both* the high (scale-up) and low (scale-down) tests — there is no separate up-window / down-window.
+
+#### `scale_metrics.cpu`
 
 | Key | Type | Constraint | Description |
 |---|---|---|---|
-| `min_connectors` | `int` | `>= 2` | Hard redundancy floor. Scale-down never reduces a Remote Network below this count. Cannot be set below 2 anywhere in the config. |
-| `max_connectors` | `int` | `>= 2`, `>= min_connectors` | Scale-up ceiling. Provisioning stops when the count reaches this value. |
-| `scale_step` | `int` | `>= 1` | Number of Connectors to add or remove per scale action. |
-| `cpu_high_pct` | `float` | `0–100`, `> cpu_low_pct` | Normalized per-effective-core CPU utilization (0–100) at or above which scale-up is triggered in the up-window. |
-| `cpu_low_pct` | `float` | `0–100`, `< cpu_high_pct` | Normalized CPU utilization at or below which scale-down may be triggered in the down-window. |
-| `throughput_high_mbps` | `float` | `>= 0`, `> throughput_low_mbps` | Per-connector tunnel throughput (Mbps) at or above which scale-up is triggered. |
-| `throughput_low_mbps` | `float` | `>= 0`, `< throughput_high_mbps` | Per-connector throughput (Mbps) at or below which scale-down may be triggered. |
-| `mem_ceiling_bytes` | `int` | `>= 0` | Optional memory limit passed to the container at provision time. `0` means no limit (memory is advisory only and never used as a scale trigger). |
-| `scale_up_window_seconds` | `int` | `>= 1` | Length of the rolling window over which CPU/throughput averages are computed for scale-up evaluation. Keep short to react quickly. |
-| `scale_down_window_seconds` | `int` | `>= 1` | Length of the rolling window for scale-down evaluation. Keep longer than `scale_up_window_seconds` to remove capacity conservatively. |
-| `scale_up_cooldown_seconds` | `int` | `>= 0` | Minimum elapsed time between two consecutive scale-up actions on the same Remote Network. Cooldown timestamps are persisted in SQLite so a manager restart cannot reset them. |
-| `scale_down_cooldown_seconds` | `int` | `>= 0` | Minimum elapsed time between two consecutive scale-down actions on the same Remote Network. |
-| `drain_grace_seconds` | `int` | `>= 0` | Seconds to wait after `connectorDelete` (which stops the controller routing new connections) before stopping and removing the container. Gives existing connections time to close. |
-| `max_restarts` | `int` | `>= 1` | Maximum number of restarts for a Connector within `restart_window_seconds` before the decider escalates from restart to replace. |
-| `restart_window_seconds` | `int` | `>= 1` | Rolling window over which restart counts are evaluated for restart-before-replace escalation. |
+| `high_pct` | `float` | `0–100`, `> low_pct` | Normalized per-effective-core CPU utilization (0–100) at or above which a Connector counts as over the CPU high watermark. |
+| `low_pct` | `float` | `0–100`, `< high_pct` | Normalized CPU utilization at or below which the CPU signal counts as low (for scale-down). |
+| `window_seconds` | `int` | `>= 1` | Length of the trailing window over which CPU is reduced before comparison. |
+| `agg` | `str` | `avg` \| `min` \| `pNN` | Time-aggregation mode applied over the window (default `avg`). See *Aggregation modes* below. |
+
+#### `scale_metrics.throughput`
+
+| Key | Type | Constraint | Description |
+|---|---|---|---|
+| `high_mbps` | `float` | `>= 0`, `> low_mbps` | Per-connector tunnel throughput (Mbps) at or above which a Connector counts as over the throughput high watermark. |
+| `low_mbps` | `float` | `>= 0`, `< high_mbps` | Per-connector throughput (Mbps) at or below which the throughput signal counts as low. |
+| `window_seconds` | `int` | `>= 1` | Length of the trailing window over which throughput is reduced before comparison. |
+| `agg` | `str` | `avg` \| `min` \| `pNN` | Time-aggregation mode applied over the window (default `avg`). |
+
+#### Aggregation modes (`agg`)
+
+Each metric's windowed samples are reduced to a single value using its `agg` mode before comparison to the watermarks:
+
+| Mode | Meaning |
+|---|---|
+| `avg` | Mean of the samples in the window (default) — smooth, the usual choice. |
+| `min` | Minimum sample in the window — approximates "stayed above the high watermark for the whole window" (the signal must *never* dip below to count as sustained-high). |
+| `pNN` | The `NN`th percentile (e.g. `p95`), `NN` in `0–100` — tolerates brief outliers while still requiring sustained load. |
+
+```yaml
+scale_metrics:
+  cpu:
+    high_pct: 75        # normalized per-effective-core %
+    low_pct: 25
+    window_seconds: 300 # short — CPU reacts fast
+    agg: avg
+  throughput:
+    high_mbps: 80       # per-connector tunnel throughput
+    low_mbps: 10
+    window_seconds: 900 # longer — throughput reacts slowly
+    agg: p95
+```
 
 ### Watermark and load semantics
 
-**High-load trigger (scale-up):** fires when *any* available signal meets or exceeds its high watermark. One saturated resource is sufficient reason to add capacity.
+A Connector is "over its high watermark" when its windowed CPU **or** its windowed throughput crosses the respective high watermark.
 
-**Low-load trigger (scale-down):** fires only when *all* available signals are at or below their low watermarks, and at least one signal is present. An absent signal never counts as low; missing data never justifies removing capacity.
+**High-load trigger (scale-up):** how per-connector crossings combine into one fleet scale-up decision is governed by `scale_up_trigger` (see below). Scale-up is always evaluated before scale-down in a cycle; if a scale-up fires, scale-down is not evaluated that cycle.
 
-Scale-up is always evaluated before scale-down in a cycle. If high load is detected, scale-down is not evaluated that cycle.
+**Low-load trigger (scale-down):** unchanged and deliberately conservative — fires only when *every* present fleet-average signal is at or below its low watermark, with at least one signal present. An absent signal never counts as low; missing data never justifies removing capacity. Scale-down never consults the per-connector trigger.
 
-### `remote_networks` — per-RN overrides
+### Scale-up trigger: `any` / `mean` / `quorum`
 
-Each entry must have `id` and `name`. All tunable fields are optional; an omitted field inherits from `defaults`. The `min_connectors` floor of 2 is re-enforced on the fully-merged result after override, so an override cannot breach it.
+Connectors in a Remote Network load-balance *new* connections, but existing connections stay pinned where they landed — so a fleet can develop **one hot Connector** while the rest sit idle. `scale_up_trigger` chooses how the per-connector high-watermark crossings combine:
 
-```yaml
-remote_networks:
-  - id: "UmVtb3RlTmV0d29yazoxMjM="   # base64 Remote Network id from the Twingate API
-    name: "aws-prod"
-    min_connectors: 3
-    max_connectors: 10
-    # all other fields inherit from defaults
-```
+| Mode | Scales up when… | Trade-off |
+|---|---|---|
+| `any` | **any single** Connector is over its high watermark | Most reactive; one hot Connector adds capacity immediately, but prone to over-provisioning on a lone sticky Connector. |
+| `mean` | the **fleet-average** windowed signal is over the high watermark | Smooth, but a single hot Connector is diluted by quiet ones and a real hotspot may never trigger. |
+| `quorum` *(default)* | at least `max(1, ceil(quorum_fraction * current_count))` Connectors are over their high watermark | The middle ground: genuine fleet-wide load scales up, but a single sticky Connector does not. |
 
-### Override resolution
-
-`Policy.resolve_remote_network(rn_id)` (`src/fc/config.py`) produces a fully-concrete `ResolvedRemoteNetwork`:
-
-1. Start with all `defaults` fields.
-2. If `rn_id` matches a `remote_networks` entry, overwrite each field for which the override provides a non-`None` value.
-3. Validate the merged result (all constraints including `max_connectors >= min_connectors` and watermark ordering).
-4. If `rn_id` is not in `remote_networks` (e.g. auto-discovered), pure defaults are used with `rn_id` as both `id` and `name`.
-
-All configured overrides are eagerly resolved at startup (`policy.resolved_networks()`), so a per-RN override whose merged result violates an invariant fails fast rather than mid-cycle.
+Chronic single-connector stickiness is usually a *load-balancing* problem, not a *capacity* one — adding a Connector does not help if clients stay pinned to the hot one. `quorum` is the default precisely because it resists that failure mode. The decision logs/metrics carry `connectors_over_high_watermark` and `hot_connector_max` (and `quorum_threshold` in quorum mode) so you can tune over time — a persistently high `hot_connector_max` with `connectors_over_high_watermark == 1` is the sticky-Connector signature (fix balancing, don't lower the quorum).
 
 ### Startup validation invariants
 
 | Invariant | Error |
 |---|---|
-| `min_connectors >= 2` | Enforced by Pydantic `ge=2` on all definitions and the merged result |
-| `max_connectors >= min_connectors` | Enforced by `RemoteNetworkDefaults` model validator and re-checked on merged result |
-| `cpu_high_pct > cpu_low_pct` | Enforced by `RemoteNetworkDefaults` model validator |
-| `throughput_high_mbps > throughput_low_mbps` | Enforced by `RemoteNetworkDefaults` model validator |
+| `min_connectors >= 2` | Enforced by Pydantic `ge=2` on the flat `Policy` model |
+| `max_connectors >= min_connectors` | Enforced by the `Policy` model validator |
+| `cpu.high_pct > cpu.low_pct` | Enforced by the `CpuScaleMetric` model validator |
+| `throughput.high_mbps > throughput.low_mbps` | Enforced by the `ThroughputScaleMetric` model validator |
+| `agg` is `avg`, `min`, or `pNN` (0–100) | Enforced by the metric model validators |
+| `0 < quorum_fraction <= 1` | Enforced by Pydantic `gt=0, le=1` on `Policy` |
 | `FC_LOG_LEVEL` is a valid level | Enforced by `Settings` model validator |
 | `FC_OVERRIDE_SECRET >= 16 chars` when overrides enabled | Enforced by `Settings` model validator |
-| No unknown YAML keys | `extra="forbid"` on all policy models |
+| No unknown YAML keys or unknown `FC_POLICY__*` env keys | `extra="forbid"` on all policy models |
 | Policy file exists and is valid YAML | Checked in `load_policy`; raises `ConfigError` |

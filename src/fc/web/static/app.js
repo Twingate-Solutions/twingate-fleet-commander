@@ -73,7 +73,6 @@ async function postOverride(path, body) {
 
 function renderConnectorRow(rn, c, overridesEnabled) {
   const flags = [];
-  if (c.janus_locked) flags.push(el("span", { class: "flag", text: "janus" }));
   if (c.cordoned) flags.push(el("span", { class: "flag", text: "cordoned" }));
 
   const nameCell = el("td", null, [c.name || c.connector_id || "—", ...flags]);
@@ -91,14 +90,23 @@ function renderConnectorRow(rn, c, overridesEnabled) {
     el("td", { text: fmtBps(c.throughput_bps) }),
   ];
   if (overridesEnabled) {
-    const btn = el("button", {
+    const cordonBtn = el("button", {
       "data-testid": "cordon-" + c.connector_id,
       text: c.cordoned ? "Uncordon" : "Cordon",
     });
-    btn.addEventListener("click", () =>
+    cordonBtn.addEventListener("click", () =>
       postOverride("/api/overrides/cordon", { connector_id: c.connector_id, cordoned: !c.cordoned })
     );
-    cells.push(el("td", null, [btn]));
+    const replaceBtn = el("button", {
+      "data-testid": "replace-" + c.connector_id,
+      title: "Provision a net-new replacement, then drain this one once it is healthy",
+      text: "Replace",
+    });
+    replaceBtn.addEventListener("click", () => {
+      if (!confirm("Replace this connector? A net-new connector is provisioned, then this one is drained once the replacement is healthy.")) return;
+      postOverride("/api/overrides/replace", { connector_id: c.connector_id });
+    });
+    cells.push(el("td", { class: "row-actions" }, [cordonBtn, replaceBtn]));
   }
   return el("tr", { class: "connectors", "data-testid": "connector-" + c.connector_id }, cells);
 }
@@ -156,8 +164,8 @@ function render(data) {
     noData.classList.add("hidden");
     document.getElementById("cycle-id").textContent = "cycle: " + snapshot.cycle_id;
     document.getElementById("updated").textContent = "updated: " + snapshot.ts;
-    for (const rn of snapshot.remote_networks) {
-      fleet.appendChild(renderRn(rn, overridesEnabled));
+    if (snapshot.remote_network) {
+      fleet.appendChild(renderRn(snapshot.remote_network, overridesEnabled));
     }
   }
 

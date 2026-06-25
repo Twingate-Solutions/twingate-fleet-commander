@@ -63,6 +63,52 @@ def is_high_load(
     return throughput_bps is not None and bps_to_mbps(throughput_bps) >= throughput_high_mbps
 
 
+def count_over_high_watermark(
+    *,
+    cpu_by_connector: dict[str, float],
+    throughput_by_connector_bps: dict[str, float],
+    cpu_high_pct: float,
+    throughput_high_mbps: float,
+) -> tuple[int, float | None]:
+    """Count how many connectors are individually over their high watermark.
+
+    A connector is "over the high watermark" when its windowed CPU is at/above
+    ``cpu_high_pct`` **or** its windowed throughput (converted to Mbps) is
+    at/above ``throughput_high_mbps``. This is the per-connector view the
+    sticky-connector ``scale_up_trigger`` modes (``any``/``quorum``) reduce over
+    the fleet, in contrast to the fleet-average :func:`is_high_load`.
+
+    Args:
+        cpu_by_connector: Map of connector id → its windowed normalized CPU
+            (per-effective-core percent). Connectors with no CPU signal are
+            simply absent.
+        throughput_by_connector_bps: Map of connector id → its windowed
+            per-connector throughput in bytes/sec. Absent when no signal.
+        cpu_high_pct: CPU high watermark (normalized percent).
+        throughput_high_mbps: Throughput high watermark in Mbps.
+
+    Returns:
+        A ``(count, hot_connector_max_cpu)`` tuple where ``count`` is the number
+        of distinct connectors (across the union of both maps) that are over the
+        high watermark, and ``hot_connector_max_cpu`` is the maximum windowed
+        CPU value across **all** connectors that have a CPU value, or ``None``
+        when no connector reported CPU.
+    """
+    ids = set(cpu_by_connector) | set(throughput_by_connector_bps)
+    count = 0
+    for connector_id in ids:
+        cpu = cpu_by_connector.get(connector_id)
+        throughput_bps = throughput_by_connector_bps.get(connector_id)
+        cpu_hot = cpu is not None and cpu >= cpu_high_pct
+        throughput_hot = (
+            throughput_bps is not None and bps_to_mbps(throughput_bps) >= throughput_high_mbps
+        )
+        if cpu_hot or throughput_hot:
+            count += 1
+    hot_connector_max_cpu = max(cpu_by_connector.values()) if cpu_by_connector else None
+    return count, hot_connector_max_cpu
+
+
 def is_low_load(
     *,
     cpu_norm: float | None,

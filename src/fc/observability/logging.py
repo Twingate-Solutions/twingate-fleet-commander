@@ -83,9 +83,21 @@ def _redact_value(value: Any) -> Any:
             return REDACTED
         return value
     if isinstance(value, Mapping):
-        return {
-            k: (REDACTED if _key_is_secret(str(k)) else _redact_value(v)) for k, v in value.items()
-        }
+        # Catch the structured env-entry shape used by the cloud actuators —
+        # ``{"name": "TWINGATE_ACCESS_TOKEN", "value": <token>}`` (ECS) and
+        # ``{"name": ..., "secureValue": <token>}`` (ACI) — where the secret
+        # hides under an innocuous ``value`` key that no key marker would flag.
+        name_field = value.get("name")
+        name_is_secret = isinstance(name_field, str) and _key_is_secret(name_field)
+        redacted: dict[Any, Any] = {}
+        for k, v in value.items():
+            if _key_is_secret(str(k)) or (
+                name_is_secret and str(k).lower() in ("value", "securevalue")
+            ):
+                redacted[k] = REDACTED
+            else:
+                redacted[k] = _redact_value(v)
+        return redacted
     if isinstance(value, (list, tuple)):
         return type(value)(_redact_value(v) for v in value)
     return value

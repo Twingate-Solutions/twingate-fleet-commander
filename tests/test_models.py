@@ -9,7 +9,6 @@ from fc.models import (
     ConnectorState,
     HealthAction,
     ManagedConnector,
-    RemoteNetworkView,
     ResourceSample,
     ScaleDecision,
     ScaleDirection,
@@ -26,10 +25,9 @@ def test_connector_state_mirrors_graphql_strings() -> None:
 
 
 def test_collector_source_values() -> None:
-    """CollectorSource enumerates the three collector identifiers."""
+    """CollectorSource enumerates the two collector identifiers."""
     assert CollectorSource.DOCKER_STATS.value == "docker_stats"
     assert CollectorSource.STDOUT_METRICS.value == "stdout_metrics"
-    assert CollectorSource.PROMETHEUS.value == "prometheus"
 
 
 def test_scale_direction_values() -> None:
@@ -43,7 +41,7 @@ def test_resource_sample_roundtrip() -> None:
     """A fully-populated ResourceSample round-trips through model_dump."""
     sample = ResourceSample(
         connector_id="c1",
-        source=CollectorSource.PROMETHEUS,
+        source=CollectorSource.STDOUT_METRICS,
         ts=datetime(2026, 6, 24, 12, 0, 0, tzinfo=UTC),
         cpu_pct_norm=42.5,
         mem_bytes=1024,
@@ -78,7 +76,6 @@ def test_managed_connector_defaults() -> None:
     assert connector.twingate_state is None
     assert connector.last_heartbeat_at is None
     assert connector.docker_health is None
-    assert connector.janus_locked is False
     assert connector.cordoned is False
     assert ManagedConnector(**connector.model_dump()) == connector
 
@@ -93,7 +90,6 @@ def test_managed_connector_roundtrip_full() -> None:
         twingate_state=ConnectorState.ALIVE,
         last_heartbeat_at=datetime(2026, 6, 24, 12, 0, 0, tzinfo=UTC),
         docker_health="healthy",
-        janus_locked=True,
         cordoned=True,
     )
     assert ManagedConnector(**connector.model_dump()) == connector
@@ -148,17 +144,3 @@ def test_action_record_roundtrip_and_default_actor() -> None:
     )
     assert manual.actor == "manual"
     assert ActionRecord(**manual.model_dump()) == manual
-
-
-def test_remote_network_view_roundtrip() -> None:
-    """RemoteNetworkView round-trips with nested connectors and aggregates."""
-    view = RemoteNetworkView(
-        rn_id="rn1",
-        name="aws-prod",
-        connectors=[
-            ManagedConnector(connector_id="c1", name="conn-1", rn_id="rn1"),
-            ManagedConnector(connector_id="c2", name="conn-2", rn_id="rn1"),
-        ],
-        aggregates={"avg_cpu": 50.0, "count": 2.0},
-    )
-    assert RemoteNetworkView(**view.model_dump()) == view

@@ -28,16 +28,28 @@ LOOP_CYCLE_ERROR: Final = "loop.cycle.error"
 LOOP_RN_ERROR: Final = "loop.rn.error"
 
 # --- Discovery -------------------------------------------------------------
+#: (debug) The discovery phase has begun.
+DISCOVER_START: Final = "discover.start"
 #: Fleet discovery finished; carries per-RN container/logical counts.
 DISCOVER_RESULT: Final = "discover.result"
+#: (debug) The discovery phase has finished.
+DISCOVER_COMPLETE: Final = "discover.complete"
 
 # --- Collection ------------------------------------------------------------
+#: (debug) The collection phase has begun.
+COLLECT_START: Final = "collect.start"
 #: (debug) A single resource sample was taken (``connector_id``, ``source``).
 COLLECT_SAMPLE: Final = "collect.sample"
 #: A collector failed for one Connector; isolated and skipped (``source``).
 COLLECT_ERROR: Final = "collect.error"
+#: (debug) The collection phase has finished (``sample_count``).
+COLLECT_COMPLETE: Final = "collect.complete"
 
 # --- Decision --------------------------------------------------------------
+#: (debug) The scale-decision phase has begun.
+DECIDE_START: Final = "decide.start"
+#: (debug) The scale-decision phase has finished.
+DECIDE_COMPLETE: Final = "decide.complete"
 #: A scale-up was decided for a Remote Network (``count``, ``reason``).
 DECIDE_SCALE_UP: Final = "decide.scale_up"
 #: A scale-down was decided for a Remote Network (``count``, ``reason``).
@@ -71,16 +83,24 @@ ACTION_REPLACE: Final = "action.replace"
 ACTION_CORDON: Final = "action.cordon"
 
 # --- Health ----------------------------------------------------------------
+#: (debug) The health-remediation phase has begun.
+HEALTH_START: Final = "health.start"
+#: (debug) The health-remediation phase has finished.
+HEALTH_COMPLETE: Final = "health.complete"
 #: Twingate reports a Connector in a ``DEAD_*`` state (``connector_id``,
 #: ``state``).
 HEALTH_CONNECTOR_DEAD: Final = "health.connector_dead"
-#: A Connector's Docker health is ``unhealthy`` (``connector_id``).
+#: A Connector's Docker health is ``unhealthy`` (``connector_id``,
+#: ``failing_streak``).
 HEALTH_UNHEALTHY: Final = "health.unhealthy"
-
-# --- Janus -----------------------------------------------------------------
-#: A Connector was skipped because the janus upgrade lock is engaged
-#: (``connector_id``).
-JANUS_LOCK_ENGAGED: Final = "janus.lock_engaged"
+#: A net-new replacement was provisioned and FC is waiting for it to become
+#: healthy before draining the old Connector (``old_connector_id``,
+#: ``new_connector_id``). The teardown happens on a later cycle (Rule #4).
+HEALTH_REPLACE_PENDING: Final = "health.replace_pending"
+#: A pending replacement did not become healthy within
+#: ``replace_health_timeout_seconds``; the old Connector is left in place and
+#: this is alertable (``old_connector_id``, ``new_connector_id``, ``waited_s``).
+HEALTH_REPLACE_TIMEOUT: Final = "health.replace_timeout"
 
 # --- Config & external-dependency errors -----------------------------------
 #: The policy configuration was (re)loaded (``path``).

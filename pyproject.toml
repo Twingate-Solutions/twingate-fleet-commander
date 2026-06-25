@@ -30,6 +30,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Cloud backends are opt-in extras so the base install (and the local-Docker
+# default) stays lean. Install with ``pip install -e '.[ecs]'`` etc. Identity is
+# taken from each SDK's standard credential chain.
+ecs = [
+    "aioboto3>=13.0",
+]
+aci = [
+    # The ACI actuator and Azure log collector talk to the Azure REST APIs over
+    # the project's existing httpx client; azure-identity only supplies bearer
+    # tokens from the managed-identity / service-principal credential chain.
+    "azure-identity>=1.17",
+]
+cloud = [
+    "fleet-commander[ecs,aci]",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
@@ -104,6 +119,13 @@ files = ["src", "tests"]
 
 [[tool.mypy.overrides]]
 module = ["aiodocker.*", "respx.*"]
+ignore_missing_imports = true
+
+# Cloud SDKs are optional extras and may be absent from the dev environment;
+# the actuators/collectors keep their imports lazy and inject clients, so these
+# stubs are only needed by the platform factory.
+[[tool.mypy.overrides]]
+module = ["aioboto3.*", "boto3.*", "botocore.*", "azure.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------

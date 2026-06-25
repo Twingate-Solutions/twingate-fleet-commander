@@ -1,1 +1,1 @@
-"""Signal collectors: docker stats, stdout metrics, and Prometheus scrape."""
+"""Signal collectors: docker stats and stdout metrics."""

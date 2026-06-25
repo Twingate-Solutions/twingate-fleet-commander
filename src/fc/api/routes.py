@@ -4,10 +4,10 @@ Two surfaces, both mounted onto the manager's FastAPI app:
 
 * **Read-only status** — ``GET /`` renders the Jinja2 status page and
   ``GET /api/status`` returns the same data as JSON (the page polls it): the
-  per-Remote-Network fleet view with counts against floor/ceiling, each
-  Connector's Twingate state + Docker health + latest sample, the recent action
-  history (from ``state.py``), a tail of recent observability events (from the
-  in-memory :class:`~fc.status.EventBuffer`), and the effective config.
+  single managed Remote Network's fleet view with counts against floor/ceiling,
+  each Connector's Twingate state + Docker health + latest sample, the recent
+  action history (from ``state.py``), a tail of recent observability events
+  (from the in-memory :class:`~fc.status.EventBuffer`), and the effective config.
 
 * **Guarded overrides** — ``POST /api/overrides/scale`` and
   ``/api/overrides/cordon``. These are **disabled by default**: when
@@ -53,25 +53,25 @@ class CordonOverrideRequest(BaseModel):
     cordoned: bool = True
 
 
+class ReplaceOverrideRequest(BaseModel):
+    """Body for a manual per-connector replace override."""
+
+    connector_id: str
+
+
 def _effective_config(policy: Policy) -> dict[str, object]:
     """Summarize the non-secret effective config for the status surface."""
-    networks = {
-        rn_id: {
-            "min_connectors": resolved.min_connectors,
-            "max_connectors": resolved.max_connectors,
-            "cpu_high_pct": resolved.cpu_high_pct,
-            "cpu_low_pct": resolved.cpu_low_pct,
-            "throughput_high_mbps": resolved.throughput_high_mbps,
-            "throughput_low_mbps": resolved.throughput_low_mbps,
-        }
-        for rn_id, resolved in policy.resolved_networks().items()
-    }
     return {
         "poll_interval_seconds": policy.poll_interval_seconds,
         "connector_image": policy.connector_image,
-        "metrics_port": policy.metrics_port,
         "collectors": policy.collectors.model_dump(),
-        "remote_networks": networks,
+        "remote_network": {
+            "id": policy.remote_network_id,
+            "name": policy.remote_network_name or policy.remote_network_id,
+            "min_connectors": policy.min_connectors,
+            "max_connectors": policy.max_connectors,
+            "scale_metrics": policy.scale_metrics.model_dump(),
+        },
     }
 
 
@@ -91,7 +91,7 @@ def create_status_router(
         status: Shared snapshot store published by the control loop.
         events: In-memory recent-events ring buffer.
         state: SQLite store, read for the recent action history.
-        policy: The effective policy (for the config view and RN resolution).
+        policy: The effective policy (for the config view).
         operator: The control surface (the loop) the overrides drive.
         override_enabled: Whether the override endpoints are active.
         override_secret: Shared secret required in the override header when
@@ -156,5 +156,21 @@ def create_status_router(
         return JSONResponse(
             {"ok": acted, "connector_id": body.connector_id, "cordoned": body.cordoned}
         )
+
+    @router.post("/api/overrides/replace")
+    async def override_replace(
+        body: ReplaceOverrideRequest,
+        x_fc_override_secret: str | None = Header(default=None),
+    ) -> JSONResponse:
+        """Replace a Connector via the cycle-spanning net-new path (guarded).
+
+        Provisions a net-new replacement and waits for it to become healthy
+        before draining the target, so the floor is never breached. Returns
+        ``acted=False`` if the Connector is not in the fleet, a replace is
+        already in flight, or provisioning failed.
+        """
+        _check_override_auth(x_fc_override_secret)
+        acted = await operator.manual_replace(body.connector_id)
+        return JSONResponse({"acted": acted, "connector_id": body.connector_id})
 
     return router

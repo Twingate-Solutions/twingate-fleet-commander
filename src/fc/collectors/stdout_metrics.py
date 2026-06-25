@@ -10,15 +10,13 @@ metrics payload onto a normalized :class:`~fc.models.ResourceSample`.
 It is opt-in and custom-image only: on the official image no metrics lines
 appear and :meth:`StdoutMetricsCollector.collect` returns ``None``.
 
-Normalization mirrors ``docker_stats``: the payload's ``cpu_pct`` is per single
-core and unbounded, so it is divided by the container's effective core count
-(from inspect) to per-effective-core utilization. Memory percent is taken
-straight from the payload, which already reports ``null`` when no limit is set.
+The line classification, schema mapping, and sample construction live in
+:mod:`fc.collectors.metrics_payload` so the Docker-log and cloud-log collectors
+share exactly one implementation; this module only adds the Docker-log transport
+and the inspect-based effective-core resolution.
 """
 
-import json
 import os
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -26,8 +24,14 @@ import structlog
 from fc.collectors.base import (
     CollectorError,
     effective_cores_from_inspect,
-    normalize_raw_cpu_pct,
 )
+from fc.collectors.metrics_payload import (
+    build_sample_from_payload,
+    has_known_fields,
+    latest_metrics_payload,
+)
+from fc.collectors.metrics_payload import parse_metrics_line as parse_metrics_line
+from fc.docker_inspect import InspectCache
 from fc.models import CollectorSource, ManagedConnector, ResourceSample
 
 if TYPE_CHECKING:
@@ -35,42 +39,10 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
-# The reliable selector: lines whose JSON has this event value are metrics.
-_METRICS_MARKER = "[metrics] "
-_METRICS_EVENT = "metrics"
-
 # Bounded tail so a busy connector's log volume never stalls the cycle; the
 # image emits one metrics line per minute, so a few hundred lines comfortably
 # covers a typical poll interval.
 _LOG_TAIL = 400
-
-
-def parse_metrics_line(line: str) -> dict[str, Any] | None:
-    """Classify one stdout line and return its metrics payload, or ``None``.
-
-    A line qualifies only if it contains the ``[metrics] `` marker and the JSON
-    after the marker parses and carries ``"event": "metrics"``. ``ANALYTICS``
-    lines, ordinary service logs, non-metrics events, and malformed JSON all
-    return ``None``.
-
-    Args:
-        line: A single raw stdout line from the container.
-
-    Returns:
-        The decoded metrics object, or ``None`` if the line is not a metrics
-        line.
-    """
-    marker = line.find(_METRICS_MARKER)
-    if marker == -1:
-        return None
-    payload = line[marker + len(_METRICS_MARKER) :].strip()
-    try:
-        decoded = json.loads(payload)
-    except (ValueError, json.JSONDecodeError):
-        return None
-    if not isinstance(decoded, dict) or decoded.get("event") != _METRICS_EVENT:
-        return None
-    return decoded
 
 
 def _iter_lines(log_result: object) -> list[str]:
@@ -87,28 +59,6 @@ def _iter_lines(log_result: object) -> list[str]:
     return lines
 
 
-def _parse_payload_ts(value: object) -> datetime:
-    """Parse the metrics payload's ISO-8601 ``ts``; fall back to now (UTC)."""
-    if isinstance(value, str) and value:
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            logger.debug("stdout_metrics.bad_ts", value=value)
-    return datetime.now(UTC)
-
-
-def _payload_throughput(payload: dict[str, Any]) -> float | None:
-    """Derive bytes/sec from the payload's per-interval net deltas."""
-    interval = payload.get("interval_sec")
-    if not isinstance(interval, (int, float)) or interval <= 0:
-        return None
-    rx = payload.get("net_rx_bytes_delta", 0)
-    tx = payload.get("net_tx_bytes_delta", 0)
-    if not isinstance(rx, (int, float)) or not isinstance(tx, (int, float)):
-        return None
-    return (rx + tx) / interval
-
-
 class StdoutMetricsCollector:
     """Collects samples from the custom image's stdout metrics lines.
 
@@ -118,7 +68,13 @@ class StdoutMetricsCollector:
 
     source = CollectorSource.STDOUT_METRICS
 
-    def __init__(self, docker: "aiodocker.Docker", *, host_cpus: int | None = None) -> None:
+    def __init__(
+        self,
+        docker: "aiodocker.Docker",
+        *,
+        host_cpus: int | None = None,
+        inspect_cache: InspectCache | None = None,
+    ) -> None:
         """Build the collector.
 
         Args:
@@ -126,9 +82,14 @@ class StdoutMetricsCollector:
             host_cpus: The host's online core count, used to resolve effective
                 cores when a container has no CPU limit. Defaults to the
                 manager host's CPU count.
+            inspect_cache: Per-cycle inspect cache shared with the actuator so a
+                container's ``show()`` is read once per cycle. A private cache is
+                built when none is supplied.
         """
         self._docker = docker
         self._host_cpus = host_cpus if host_cpus and host_cpus > 0 else (os.cpu_count() or 1)
+        self._inspect = inspect_cache or InspectCache(docker)
+        self._drift_warned = False
 
     async def collect(self, connector: ManagedConnector) -> ResourceSample | None:
         """Return the latest stdout-metrics sample for a Connector, or ``None``.
@@ -155,43 +116,38 @@ class StdoutMetricsCollector:
         except Exception as exc:
             raise CollectorError(f"docker log read failed: {type(exc).__name__}") from exc
 
-        payload = self._latest_metrics(raw_log)
+        payload = latest_metrics_payload(_iter_lines(raw_log))
         if payload is None:
             return None
+        self._warn_on_schema_drift(payload, connector)
 
         try:
-            inspect = await container.show()
+            inspect = await self._inspect.inspect(connector.container_id)
         except Exception as exc:
             raise CollectorError(f"docker inspect failed: {type(exc).__name__}") from exc
         effective_cores = effective_cores_from_inspect(inspect, host_cpus=self._host_cpus)
 
-        cpu_pct_raw = payload.get("cpu_pct")
-        cpu_norm = (
-            normalize_raw_cpu_pct(cpu_pct=float(cpu_pct_raw), effective_cores=effective_cores)
-            if isinstance(cpu_pct_raw, (int, float))
-            else None
-        )
-
-        mem_bytes_raw = payload.get("mem_bytes")
-        mem_bytes = int(mem_bytes_raw) if isinstance(mem_bytes_raw, (int, float)) else None
-        mem_pct_raw = payload.get("mem_pct")
-        mem_pct = float(mem_pct_raw) if isinstance(mem_pct_raw, (int, float)) else None
-
-        return ResourceSample(
+        return build_sample_from_payload(
+            payload,
             connector_id=connector.connector_id,
+            effective_cores=effective_cores,
             source=CollectorSource.STDOUT_METRICS,
-            ts=_parse_payload_ts(payload.get("ts")),
-            cpu_pct_norm=cpu_norm,
-            mem_bytes=mem_bytes,
-            mem_pct=mem_pct,
-            throughput_bps=_payload_throughput(payload),
         )
 
-    def _latest_metrics(self, raw_log: object) -> dict[str, Any] | None:
-        """Return the most recent metrics payload in a raw log result."""
-        latest: dict[str, Any] | None = None
-        for line in _iter_lines(raw_log):
-            parsed = parse_metrics_line(line)
-            if parsed is not None:
-                latest = parsed
-        return latest
+    def _warn_on_schema_drift(self, payload: dict[str, Any], connector: ManagedConnector) -> None:
+        """Warn once if a metrics line parsed but carries no known schema field.
+
+        A well-formed ``[metrics]`` line that yields none of the known fields
+        means the upstream image's metrics schema drifted: every field would map
+        to ``None`` and the collector would silently degrade. Surfacing it once
+        makes the drift visible without flooding the logs.
+        """
+        if self._drift_warned:
+            return
+        if not has_known_fields(payload):
+            self._drift_warned = True
+            logger.warning(
+                "stdout_metrics.schema_drift",
+                connector_id=connector.connector_id,
+                keys=sorted(str(k) for k in payload),
+            )

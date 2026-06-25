@@ -21,6 +21,27 @@ from fc.models import ManagedConnector
 from fc.twingate.client import ConnectorTokens
 
 
+class ActuatorError(Exception):
+    """Base class for a backend lifecycle failure raised by any actuator.
+
+    Every :class:`Actuator` implementation (Docker, ECS, ACI, ...) raises a
+    subclass of this so the control loop can catch, count, log, and continue
+    without knowing which compute backend is active (Key Design Rule #9). The
+    message carries only the operation name and a secret-free description —
+    never a token, env value, or other secret.
+    """
+
+    def __init__(self, message: str, *, op: str) -> None:
+        """Build the error with secret-free context.
+
+        Args:
+            message: Human-readable description (no secrets).
+            op: The actuator operation that failed (e.g. ``"provision"``).
+        """
+        self.op = op
+        super().__init__(f"{message} op={op}")
+
+
 @runtime_checkable
 class Actuator(Protocol):
     """Drives the compute lifecycle of managed Connectors.
@@ -35,10 +56,12 @@ class Actuator(Protocol):
         connector_id: str,
         name: str,
         tokens: ConnectorTokens,
-        *,
-        mem_limit_bytes: int | None = None,
     ) -> str:
         """Start a Connector's compute with its tokens and management markers.
+
+        Implementations apply Twingate's prescribed per-connector resource
+        limits (1 vCPU / 2 GB — Key Design Rule N2) so the CPU and throughput
+        watermarks are measured against a known capacity envelope.
 
         Args:
             rn_id: The Remote Network the Connector belongs to.
@@ -47,7 +70,6 @@ class Actuator(Protocol):
                 logical Connector.
             name: The Connector/compute name.
             tokens: The freshly minted, single-use access/refresh token pair.
-            mem_limit_bytes: Optional memory limit for the compute unit.
 
         Returns:
             The backend identifier of the started compute (e.g. container id).

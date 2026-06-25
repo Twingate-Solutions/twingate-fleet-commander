@@ -68,6 +68,27 @@ def test_redacts_nested_mapping_and_list() -> None:
     assert out["items"] == [REDACTED, "fine"]
 
 
+def test_redacts_structured_env_entry_token_shape() -> None:
+    # The cloud actuators carry tokens as ``{"name": "TWINGATE_*_TOKEN",
+    # "value"/"secureValue": <token>}`` — the secret hides under an innocuous key
+    # that no key marker would catch, so the backstop keys off the ``name`` field.
+    out = _redact(
+        {
+            "overrides": [
+                {"name": "TWINGATE_ACCESS_TOKEN", "value": "ecs_leaked"},
+                {"name": "TWINGATE_REFRESH_TOKEN", "secureValue": "aci_leaked"},
+                {"name": "TWINGATE_NETWORK", "value": "acme"},
+            ]
+        }
+    )
+    overrides = out["overrides"]
+    assert isinstance(overrides, list)
+    assert overrides[0] == {"name": "TWINGATE_ACCESS_TOKEN", "value": REDACTED}
+    assert overrides[1] == {"name": "TWINGATE_REFRESH_TOKEN", "secureValue": REDACTED}
+    # A non-secret name leaves its value intact.
+    assert overrides[2] == {"name": "TWINGATE_NETWORK", "value": "acme"}
+
+
 def test_non_secret_values_pass_through() -> None:
     out = _redact({"rn_id": "rn-1", "count": 3, "cpu": 42.0})
     assert out == {"rn_id": "rn-1", "count": 3, "cpu": 42.0}

@@ -6,7 +6,7 @@ aggregator, and a real metrics registry. The matrix mirrors the safety rails:
 scale-up on sustained high load, scale-down draining before delete, no action
 within watermarks, cooldown suppression, collector-error isolation, the per-
 cycle heartbeat + metric updates, restart-before-replace health remediation,
-janus-lock skipping, and the loop surviving a discovery failure.
+and the loop surviving a discovery failure.
 """
 
 import asyncio
@@ -42,44 +42,38 @@ NOW = datetime(2026, 6, 24, 12, 0, 0, tzinfo=UTC)
 _POLICY_DICT: dict[str, Any] = {
     "poll_interval_seconds": 30,
     "connector_image": "twingate/connector:1",
-    "metrics_port": 9999,
-    "collectors": {"docker_stats": True, "stdout_metrics": False, "prometheus": True},
+    "collectors": {"docker_stats": True, "stdout_metrics": False},
     "labels": {
         "managed": "twingate.fc.managed",
         "remote_network": "twingate.fc.rn",
         "connector_id": "twingate.fc.connector_id",
     },
-    "janus_lock_label": "twingate.janus.upgrading",
-    "defaults": {
-        "min_connectors": 2,
-        "max_connectors": 6,
-        "scale_step": 1,
-        "cpu_high_pct": 75.0,
-        "cpu_low_pct": 25.0,
-        "throughput_high_mbps": 80.0,
-        "throughput_low_mbps": 10.0,
-        "mem_ceiling_bytes": 0,
-        "scale_up_window_seconds": 300,
-        "scale_down_window_seconds": 1200,
-        "scale_up_cooldown_seconds": 600,
-        "scale_down_cooldown_seconds": 1800,
-        "drain_grace_seconds": 120,
-        "max_restarts": 3,
-        "restart_window_seconds": 600,
-        # Disabled here so the existing single-cycle health tests assert restart
-        # behavior directly; the startup grace window is wired-tested separately
-        # (test_startup_grace_defers_restart) and unit-tested in test_decider.
-        "startup_grace_seconds": 0,
+    "remote_network_id": "rn-1",
+    "remote_network_name": "rn-1",
+    "min_connectors": 2,
+    "max_connectors": 6,
+    "scale_step": 1,
+    "scale_metrics": {
+        "cpu": {"high_pct": 75.0, "low_pct": 25.0, "window_seconds": 300, "agg": "avg"},
+        "throughput": {"high_mbps": 80.0, "low_mbps": 10.0, "window_seconds": 1200, "agg": "avg"},
     },
-    "remote_networks": [{"id": "rn-1", "name": "rn-1"}],
+    "scale_up_cooldown_seconds": 600,
+    "scale_down_cooldown_seconds": 1800,
+    "drain_grace_seconds": 120,
+    "max_restarts": 3,
+    "restart_window_seconds": 600,
+    # Disabled here so the existing single-cycle health tests assert restart
+    # behavior directly; the startup grace window is wired-tested separately
+    # (test_startup_grace_defers_restart) and unit-tested in test_decider.
+    "startup_grace_seconds": 0,
+    # Disabled by default so single-cycle health tests act immediately; the
+    # duration gate is wired-tested explicitly (test_unhealthy_threshold_*).
+    "unhealthy_threshold_seconds": 0,
 }
 
 
-def _policy(**defaults_overrides: Any) -> Policy:
-    data = {**_POLICY_DICT}
-    if defaults_overrides:
-        data["defaults"] = {**_POLICY_DICT["defaults"], **defaults_overrides}
-    return Policy.model_validate(data)
+def _policy(**overrides: Any) -> Policy:
+    return Policy.model_validate({**_POLICY_DICT, **overrides})
 
 
 # --- fakes -----------------------------------------------------------------
@@ -133,8 +127,6 @@ class FakeActuator:
         connector_id: str,
         name: str,
         tokens: ConnectorTokens,
-        *,
-        mem_limit_bytes: int | None = None,
     ) -> str:
         self._seq += 1
         self.calls.append(("provision", connector_id))
@@ -190,14 +182,13 @@ async def _noop_sleep(_seconds: float) -> None:
     return None
 
 
-def _container(cid: str, *, health: str = "healthy", janus: bool = False) -> ManagedConnector:
+def _container(cid: str, *, health: str = "healthy") -> ManagedConnector:
     return ManagedConnector(
         connector_id=cid,
         name=cid,
         rn_id="rn-1",
         container_id=f"ctr-{cid}",
         docker_health=health,
-        janus_locked=janus,
     )
 
 
@@ -213,6 +204,7 @@ async def _make_loop(
     collectors: list[Any],
     policy: Policy | None = None,
     status: StatusState | None = None,
+    clock: Any = None,
 ) -> tuple[ControlLoop, FakeTwingate, FakeActuator, Metrics, StateStore]:
     state = StateStore(tmp_path / "state.sqlite3")
     await state.init()
@@ -227,7 +219,7 @@ async def _make_loop(
         aggregator=Aggregator(retention_seconds=3600),
         state=state,
         metrics=metrics,
-        clock=lambda: NOW,
+        clock=clock or (lambda: NOW),
         name_factory=lambda rn: f"{rn}-new",
         id_factory=lambda: "cycle-1",
         sleep=_noop_sleep,
@@ -268,6 +260,38 @@ async def test_full_cycle_scale_up(tmp_path: Path) -> None:
     assert "decide.scale_up" in _events(cap)
 
 
+async def test_scale_up_any_mode_on_single_hot_connector(tmp_path: Path) -> None:
+    # Per-connector hot spread: c1 pinned hot, the rest cool. Under the ``any``
+    # trigger a single hot connector is enough to scale the fleet up, even though
+    # the fleet mean would be well below the high watermark.
+    hot = FakeCollector(CollectorSource.DOCKER_STATS, cpu=100.0)
+    cool = FakeCollector(CollectorSource.DOCKER_STATS, cpu=10.0)
+
+    class _PerConnectorCollector:
+        """Routes a hot reading to c1 and a cool reading to everyone else."""
+
+        source = CollectorSource.DOCKER_STATS
+
+        async def collect(self, connector: ManagedConnector) -> ResourceSample | None:
+            chosen = hot if connector.connector_id == "c1" else cool
+            return await chosen.collect(connector)
+
+    loop, twingate, actuator, _metrics, _state = await _make_loop(
+        tmp_path,
+        containers=[_container(f"c{i}") for i in range(1, 5)],
+        tg_connectors=[_tg(f"c{i}") for i in range(1, 5)],
+        collectors=[_PerConnectorCollector()],
+        policy=_policy(scale_up_trigger="any"),
+    )
+    result = await loop.run_cycle()
+
+    assert result.decisions[0].direction is ScaleDirection.UP
+    assert result.decisions[0].metrics["connectors_over_high_watermark"] == 1.0
+    assert result.decisions[0].metrics["hot_connector_max"] == 100.0
+    assert twingate.created == ["new-1"]
+    assert ("provision", "new-1") in actuator.calls
+
+
 async def test_scale_down_drains_before_delete(tmp_path: Path) -> None:
     loop, twingate, actuator, metrics, state = await _make_loop(
         tmp_path,
@@ -306,6 +330,10 @@ async def test_no_action_within_watermarks(tmp_path: Path) -> None:
     assert twingate.created == [] and twingate.deleted == []
     assert actuator.calls == []
     assert "decide.no_action" in _events(cap)
+    # The idle decision still surfaces its signal metrics for diagnostics.
+    no_action_event = next(e for e in cap if e["event"] == "decide.no_action")
+    assert "metrics" in no_action_event
+    assert "connectors_over_high_watermark" in no_action_event["metrics"]
 
 
 async def test_cooldown_suppresses_scale_up(tmp_path: Path) -> None:
@@ -323,6 +351,9 @@ async def test_cooldown_suppresses_scale_up(tmp_path: Path) -> None:
     assert result.decisions[0].direction is ScaleDirection.NONE
     assert twingate.created == []
     assert "decide.cooldown_skip" in _events(cap)
+    cooldown_event = next(e for e in cap if e["event"] == "decide.cooldown_skip")
+    assert "metrics" in cooldown_event
+    assert "cooldown_seconds_remaining" in cooldown_event["metrics"]
 
 
 async def test_collector_error_isolated_cycle_completes(tmp_path: Path) -> None:
@@ -332,7 +363,7 @@ async def test_collector_error_isolated_cycle_completes(tmp_path: Path) -> None:
         tg_connectors=[_tg("c1")],
         collectors=[
             FakeCollector(CollectorSource.DOCKER_STATS, raises=True),
-            FakeCollector(CollectorSource.PROMETHEUS, cpu=50.0),
+            FakeCollector(CollectorSource.STDOUT_METRICS, cpu=50.0),
         ],
     )
     with structlog.testing.capture_logs() as cap:
@@ -385,14 +416,55 @@ async def test_health_restart_dead_connector(tmp_path: Path) -> None:
     assert "health.connector_dead" in events and "action.restart" in events
     restarts = await state.count_recent_restarts("c1", since=NOW - timedelta(seconds=600))
     assert restarts == 1
+    # The restart line carries the decider's reason and the triggering sample.
+    restart_event = next(e for e in cap if e["event"] == "action.restart")
+    assert restart_event["reason"]  # non-empty reason string
+    assert restart_event["state"] == "DEAD_NO_HEARTBEAT"
+    assert restart_event["sample"] == {
+        "cpu_pct_norm": 50.0,
+        "throughput_bps": None,
+        "mem_bytes": None,
+        "source": "docker_stats",
+    }
+    # fc_health_actions_total increments with kind=restart, the dead reason class.
+    assert (
+        metrics.registry.get_sample_value(
+            "fc_health_actions_total",
+            {"kind": "restart", "reason_class": "dead_no_heartbeat"},
+        )
+        == 1.0
+    )
+
+
+async def test_health_restart_docker_unhealthy_reason_class(tmp_path: Path) -> None:
+    # A connector that is ALIVE in Twingate but unhealthy per Docker is restarted
+    # and classified as docker_unhealthy on the fc_health_actions counter.
+    loop, _twingate, actuator, metrics, _state = await _make_loop(
+        tmp_path,
+        containers=[_container("c1", health="unhealthy"), _container("c2")],
+        tg_connectors=[_tg("c1"), _tg("c2")],
+        collectors=[FakeCollector(CollectorSource.DOCKER_STATS, cpu=50.0)],
+    )
+    with structlog.testing.capture_logs() as cap:
+        await loop.run_cycle()
+
+    assert ("restart", "c1") in actuator.calls
+    restart_event = next(e for e in cap if e["event"] == "action.restart")
+    assert restart_event["reason"]
+    assert restart_event["state"] == "ALIVE"
+    assert (
+        metrics.registry.get_sample_value(
+            "fc_health_actions_total",
+            {"kind": "restart", "reason_class": "docker_unhealthy"},
+        )
+        == 1.0
+    )
 
 
 async def test_startup_grace_defers_restart(tmp_path: Path) -> None:
     # A freshly-discovered, never-heartbeated DEAD_NO_HEARTBEAT connector is in
     # its startup grace window this cycle, so the loop must NOT restart it.
-    graced = Policy.model_validate(
-        {**_POLICY_DICT, "defaults": {**_POLICY_DICT["defaults"], "startup_grace_seconds": 90}}
-    )
+    graced = _policy(startup_grace_seconds=90)
     loop, _twingate, actuator, _metrics, _state = await _make_loop(
         tmp_path,
         containers=[_container("c1"), _container("c2")],
@@ -407,133 +479,224 @@ async def test_startup_grace_defers_restart(tmp_path: Path) -> None:
     assert "action.restart" not in _events(cap)
 
 
-async def test_health_replace_after_max_restarts(tmp_path: Path) -> None:
+async def _seed_restarts(state: StateStore, connector_id: str, n: int) -> None:
+    """Record ``n`` prior restart actions so the next health decision replaces."""
+    for _ in range(n):
+        await state.record_action(
+            ActionRecord(
+                ts=NOW, rn_id="rn-1", action="restart", count=1, reason="r", outcome="success"
+            ),
+            connector_id=connector_id,
+        )
+
+
+async def test_health_replace_waits_for_healthy_then_drains_old(tmp_path: Path) -> None:
+    # Wait-for-healthy, cycle-spanning replace (Key Design Rule #4): cycle 1
+    # provisions the replacement but leaves the old connector running; only once
+    # the replacement reports ALIVE/healthy (cycle 2) is the old one drained.
     loop, twingate, actuator, metrics, state = await _make_loop(
         tmp_path,
         containers=[_container("c1"), _container("c2")],
         tg_connectors=[_tg("c1", ConnectorState.DEAD_HEARTBEAT_TOO_OLD), _tg("c2")],
         collectors=[FakeCollector(CollectorSource.DOCKER_STATS, cpu=50.0)],
     )
-    for _ in range(3):
-        await state.record_action(
-            ActionRecord(
-                ts=NOW, rn_id="rn-1", action="restart", count=1, reason="r", outcome="success"
-            ),
-            connector_id="c1",
-        )
+    await _seed_restarts(state, "c1", 3)
 
-    with structlog.testing.capture_logs() as cap:
+    # Cycle 1: replacement provisioned, old NOT torn down (awaiting health).
+    with structlog.testing.capture_logs() as cap1:
         await loop.run_cycle()
+    assert twingate.created == ["new-1"]
+    assert ("provision", "new-1") in actuator.calls
+    assert "c1" not in twingate.deleted
+    assert ("deprovision", "c1") not in actuator.calls
+    assert "health.replace_pending" in _events(cap1)
+    assert metrics.registry.get_sample_value("fc_replacements_total", {"rn": "rn-1"}) is None
+    # The replace initiation carries the decider's reason + triggering sample.
+    pending_event = next(e for e in cap1 if e["event"] == "health.replace_pending")
+    assert pending_event["reason"]
+    assert pending_event["state"] == "DEAD_HEARTBEAT_TOO_OLD"
+    assert pending_event["sample"] == {
+        "cpu_pct_norm": 50.0,
+        "throughput_bps": None,
+        "mem_bytes": None,
+        "source": "docker_stats",
+    }
+    # A replace is one health action: kind=replace, dead_heartbeat_too_old class.
+    assert (
+        metrics.registry.get_sample_value(
+            "fc_health_actions_total",
+            {"kind": "replace", "reason_class": "dead_heartbeat_too_old"},
+        )
+        == 1.0
+    )
 
-    # Provision-new-then-delete-old: a new connector is created and the old
-    # one's logical Connector is deleted and its container removed.
-    assert twingate.created  # replacement provisioned
+    # The replacement now appears in the fleet, ALIVE and healthy.
+    actuator._managed.append(_container("new-1"))
+    twingate._tg.append(_tg("new-1"))
+
+    # Cycle 2: replacement healthy → drain + delete the old one; replace done.
+    with structlog.testing.capture_logs() as cap2:
+        await loop.run_cycle()
     assert "c1" in twingate.deleted
     assert ("deprovision", "c1") in actuator.calls
     assert metrics.registry.get_sample_value("fc_replacements_total", {"rn": "rn-1"}) == 1.0
-    assert "action.replace" in _events(cap)
+    replace_event = next(e for e in cap2 if e["event"] == "action.replace")
+    assert replace_event["old_removed"] is True
+    # The completion line reuses the stored reason from when the replace began.
+    assert replace_event["reason"]
 
 
-async def test_replace_partial_failure_not_counted_success(tmp_path: Path) -> None:
-    # The replacement is provisioned but the OLD connector fails to drain/remove.
-    # The replace is incomplete: the replacements metric must NOT increment and
-    # the audit row must record a failure (Rule #4 — capacity is never silently
-    # overstated). The still-unhealthy old connector is left for a later cycle.
-    loop, twingate, actuator, metrics, state = await _make_loop(
+async def test_replace_does_not_drain_old_until_replacement_healthy(tmp_path: Path) -> None:
+    # If the replacement is present but not yet ALIVE, the old connector is left
+    # in place across cycles — capacity is never dropped pre-emptively.
+    loop, twingate, actuator, _metrics, state = await _make_loop(
         tmp_path,
         containers=[_container("c1"), _container("c2")],
         tg_connectors=[_tg("c1", ConnectorState.DEAD_HEARTBEAT_TOO_OLD), _tg("c2")],
         collectors=[FakeCollector(CollectorSource.DOCKER_STATS, cpu=50.0)],
+        policy=_policy(startup_grace_seconds=90),
     )
-    for _ in range(3):
-        await state.record_action(
-            ActionRecord(
-                ts=NOW, rn_id="rn-1", action="restart", count=1, reason="r", outcome="success"
-            ),
-            connector_id="c1",
-        )
-    actuator.deprovision_should_raise = True
+    await _seed_restarts(state, "c1", 3)
+    await loop.run_cycle()  # provisions new-1, registers pending
+
+    # Replacement appears but is still DEAD_NO_HEARTBEAT (not yet carrying load).
+    actuator._managed.append(_container("new-1"))
+    twingate._tg.append(_tg("new-1", ConnectorState.DEAD_NO_HEARTBEAT))
+
+    await loop.run_cycle()
+    assert "c1" not in twingate.deleted
+    assert ("deprovision", "c1") not in actuator.calls
+
+
+async def test_replace_timeout_tears_down_failed_replacement_and_frees_old(tmp_path: Path) -> None:
+    # When the replacement never becomes healthy within
+    # replace_health_timeout_seconds, the replace attempt has failed: FC must
+    # (a) emit the alertable timeout, (b) tear down the failed *replacement*
+    # (which never carried traffic), (c) clear the pending slot, and (d) leave
+    # the OLD, traffic-serving connector running (Key Design Rule #4). The old
+    # one then becomes eligible for remediation again on the next cycle.
+    clock = {"t": NOW}
+    loop, twingate, actuator, _metrics, state = await _make_loop(
+        tmp_path,
+        containers=[_container("c1"), _container("c2")],
+        tg_connectors=[_tg("c1", ConnectorState.DEAD_HEARTBEAT_TOO_OLD), _tg("c2")],
+        collectors=[FakeCollector(CollectorSource.DOCKER_STATS, cpu=50.0)],
+        policy=_policy(startup_grace_seconds=90, replace_health_timeout_seconds=300),
+        clock=lambda: clock["t"],
+    )
+    await _seed_restarts(state, "c1", 3)
+    await loop.run_cycle()  # provisions new-1 at NOW, registers pending
+
+    # Replacement appears but stays unhealthy; the clock moves past the bound.
+    actuator._managed.append(_container("new-1"))
+    twingate._tg.append(_tg("new-1", ConnectorState.DEAD_NO_HEARTBEAT))
+    clock["t"] = NOW + timedelta(seconds=301)
 
     with structlog.testing.capture_logs() as cap:
-        result = await loop.run_cycle()
+        await loop.run_cycle()
+    # (a) alertable timeout emitted, (b) failed replacement torn down, (c) old
+    # connector left running (never deprovisioned-as-old by the timeout path).
+    assert "health.replace_timeout" in _events(cap)
+    assert "new-1" in twingate.deleted
+    assert ("deprovision", "new-1") in actuator.calls
+    assert "c1" not in twingate.deleted
+    assert ("deprovision", "c1") not in actuator.calls
 
-    assert result.ok  # the cycle survives the partial replace
-    assert twingate.created  # the replacement was still provisioned
-    # No completed replace ⇒ the metric is never observed for this RN.
-    assert metrics.registry.get_sample_value("fc_replacements_total", {"rn": "rn-1"}) is None
-    replace_event = next(e for e in cap if e["event"] == "action.replace")
-    assert replace_event["old_removed"] is False
-    recent = await state.recent_actions(limit=20)
-    replace_rows = [r for r in recent if r.action == "replace"]
-    assert replace_rows and replace_rows[0].outcome == "fail"
+    # (d) the pending slot for the failed replace is released, so the still-
+    # unhealthy old connector is no longer excluded from remediation: the same
+    # cycle's health pass re-escalates it (its restart count still exceeds
+    # max_restarts), beginning a fresh replace — a fail-forward retry. The old
+    # entry for new-1 is gone; a new pending replace (new-2) takes its place.
+    assert "health.replace_pending" in _events(cap)
+    assert "c1" in loop._pending_replaces
+    assert loop._pending_replaces["c1"].new_connector_id == "new-2"
+    assert twingate.created == ["new-1", "new-2"]
+    # The old connector itself is still untouched (never the one torn down).
+    assert "c1" not in twingate.deleted
 
 
-async def test_per_remote_network_error_isolated(
+async def test_unhealthy_threshold_gates_then_acts(tmp_path: Path) -> None:
+    # A connector unhealthy for less than unhealthy_threshold_seconds is left
+    # alone (brief blip); once it has been continuously unhealthy past the gate,
+    # it is restarted.
+    clock = {"t": NOW}
+    loop, _twingate, actuator, _metrics, _state = await _make_loop(
+        tmp_path,
+        containers=[_container("c1", health="unhealthy"), _container("c2")],
+        tg_connectors=[_tg("c1"), _tg("c2")],
+        collectors=[FakeCollector(CollectorSource.DOCKER_STATS, cpu=50.0)],
+        policy=_policy(unhealthy_threshold_seconds=60),
+        clock=lambda: clock["t"],
+    )
+
+    await loop.run_cycle()  # first unhealthy observation → within gate → no action
+    assert all(call[0] != "restart" for call in actuator.calls)
+
+    clock["t"] = NOW + timedelta(seconds=61)
+    await loop.run_cycle()  # continuously unhealthy past the gate → restart
+    assert ("restart", "c1") in actuator.calls
+
+
+async def test_unhealthy_timer_resets_on_recovery(tmp_path: Path) -> None:
+    # Recovery between cycles resets the continuous-unhealth timer, so a later
+    # blip starts counting from scratch and does not immediately act.
+    clock = {"t": NOW}
+    loop, _twingate, actuator, _metrics, _state = await _make_loop(
+        tmp_path,
+        containers=[_container("c1", health="unhealthy"), _container("c2")],
+        tg_connectors=[_tg("c1"), _tg("c2")],
+        collectors=[FakeCollector(CollectorSource.DOCKER_STATS, cpu=50.0)],
+        policy=_policy(unhealthy_threshold_seconds=60),
+        clock=lambda: clock["t"],
+    )
+    await loop.run_cycle()  # unhealthy at NOW (within gate)
+
+    # Recovers: the loop's first-unhealthy timer for c1 clears.
+    actuator._managed[0] = _container("c1", health="healthy")
+    clock["t"] = NOW + timedelta(seconds=40)
+    await loop.run_cycle()
+
+    # Goes unhealthy again well after the original first-unhealthy time; because
+    # the timer reset, it is still within the gate and must not act yet.
+    actuator._managed[0] = _container("c1", health="unhealthy")
+    clock["t"] = NOW + timedelta(seconds=80)
+    await loop.run_cycle()
+    assert all(call[0] != "restart" for call in actuator.calls)
+
+
+async def test_remote_network_decide_error_isolated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # One Remote Network blows up while deciding (a non-typed sqlite-style
-    # error); the other RN must still be acted on and the cycle must still
-    # complete with its heartbeat and freshness timestamp (Rule: one bad RN
-    # never aborts a cycle).
-    def _rn2(cid: str) -> ManagedConnector:
-        return ManagedConnector(
-            connector_id=cid,
-            name=cid,
-            rn_id="rn-2",
-            container_id=f"ctr-{cid}",
-            docker_health="healthy",
-        )
-
-    def _tg2(cid: str) -> ManagedConnector:
-        return ManagedConnector(
-            connector_id=cid, name=cid, rn_id="rn-2", twingate_state=ConnectorState.ALIVE
-        )
-
-    loop, twingate, actuator, metrics, state = await _make_loop(
+    # The single Remote Network blows up while deciding (a non-typed sqlite-
+    # style error). The cycle must survive: the error is logged as
+    # loop.rn.error and the heartbeat + freshness timestamp still publish
+    # (Rule: a decide/act failure never aborts the cycle).
+    loop, twingate, actuator, metrics, _state = await _make_loop(
         tmp_path,
-        containers=[_container("c1"), _container("c2"), _rn2("d1"), _rn2("d2")],
-        tg_connectors=[_tg("c1"), _tg("c2"), _tg2("d1"), _tg2("d2")],
+        containers=[_container("c1"), _container("c2")],
+        tg_connectors=[_tg("c1"), _tg("c2")],
         collectors=[FakeCollector(CollectorSource.DOCKER_STATS, cpu=90.0)],
     )
 
-    real_get = state.get_cooldowns
-
     async def flaky_get_cooldowns(rn_id: str) -> Cooldowns:
-        if rn_id == "rn-2":
-            raise RuntimeError("sqlite locked")
-        return await real_get(rn_id)
+        raise RuntimeError("sqlite locked")
 
-    monkeypatch.setattr(state, "get_cooldowns", flaky_get_cooldowns)
+    monkeypatch.setattr(loop._state, "get_cooldowns", flaky_get_cooldowns)
 
     with structlog.testing.capture_logs() as cap:
         result = await loop.run_cycle()
 
-    assert result.ok  # the cycle completes despite rn-2 failing
+    assert result.ok  # the cycle completes despite the decide failure
     rn_errors = [e for e in cap if e["event"] == "loop.rn.error"]
-    assert rn_errors and rn_errors[0]["rn_id"] == "rn-2"
-    # rn-1 was still scaled up (the healthy RN is unaffected by rn-2's failure).
-    assert twingate.created and any(call[0] == "provision" for call in actuator.calls)
+    assert rn_errors and rn_errors[0]["rn_id"] == "rn-1"
+    # The decide failed before any action, so nothing was provisioned.
+    assert twingate.created == [] and actuator.calls == []
     # Heartbeat + freshness timestamp still published.
     assert any(e["event"] == "loop.cycle.complete" for e in cap)
     assert (
         metrics.registry.get_sample_value("fc_last_successful_cycle_timestamp_seconds")
         == NOW.timestamp()
     )
-
-
-async def test_janus_locked_connector_skipped(tmp_path: Path) -> None:
-    loop, _twingate, actuator, _metrics, _state = await _make_loop(
-        tmp_path,
-        containers=[_container("c1", janus=True), _container("c2")],
-        tg_connectors=[_tg("c1", ConnectorState.DEAD_NO_RELAYS), _tg("c2")],
-        collectors=[FakeCollector(CollectorSource.DOCKER_STATS, cpu=50.0)],
-    )
-    with structlog.testing.capture_logs() as cap:
-        await loop.run_cycle()
-
-    assert ("restart", "c1") not in actuator.calls
-    assert all(call[0] != "restart" for call in actuator.calls)
-    assert "janus.lock_engaged" in _events(cap)
 
 
 async def test_discovery_failure_aborts_cycle_but_survives(tmp_path: Path) -> None:
@@ -636,7 +799,7 @@ async def test_cycle_publishes_status_snapshot(tmp_path: Path) -> None:
     snap = status.get()
     assert snap is not None
     assert snap.cycle_id == "cycle-1"
-    rn = snap.remote_networks[0]
+    rn = snap.remote_network
     assert rn.rn_id == "rn-1" and rn.count == 2
     assert rn.min_connectors == 2 and rn.max_connectors == 6
     c1 = next(c for c in rn.connectors if c.connector_id == "c1")
@@ -777,3 +940,86 @@ async def test_manual_cordon_unknown_connector_refused(tmp_path: Path) -> None:
     assert acted is False
     assert await state.list_cordoned() == set()
     assert await state.recent_actions(limit=5) == []
+
+
+async def test_manual_replace_provisions_new_and_waits_for_healthy(tmp_path: Path) -> None:
+    # A manual replace is net-new and cycle-spanning (Q1b + Rule #4): it
+    # provisions the replacement and registers a pending replace WITHOUT tearing
+    # down the target. At the floor (2 connectors) this still holds — capacity is
+    # never dropped, so the floor is honored implicitly.
+    loop, twingate, actuator, _metrics, state = await _make_loop(
+        tmp_path,
+        containers=[_container("c1"), _container("c2")],
+        tg_connectors=[_tg("c1"), _tg("c2")],
+        collectors=[],
+    )
+    acted = await loop.manual_replace("c1")
+    assert acted is True
+    # Replacement provisioned; target NOT torn down yet (wait-for-healthy).
+    assert twingate.created == ["new-1"]
+    assert ("provision", "new-1") in actuator.calls
+    assert "c1" not in twingate.deleted
+    assert ("deprovision", "c1") not in actuator.calls
+    # A pending replace is registered and tagged as a manual action.
+    assert "c1" in loop._pending_replaces
+    assert loop._pending_replaces["c1"].new_connector_id == "new-1"
+    assert loop._pending_replaces["c1"].actor == "manual"
+    # The provision step is audited with actor=manual.
+    actions = await state.recent_actions(limit=5)
+    assert actions[0].actor == "manual"
+
+
+async def test_manual_replace_completes_with_manual_actor_on_next_cycle(tmp_path: Path) -> None:
+    # Once the replacement reports ALIVE/healthy on a later cycle, the old
+    # connector is drained and the completion is audited as actor=manual.
+    loop, twingate, actuator, metrics, state = await _make_loop(
+        tmp_path,
+        containers=[_container("c1"), _container("c2")],
+        tg_connectors=[_tg("c1"), _tg("c2")],
+        collectors=[],
+    )
+    await loop.manual_replace("c1")
+
+    # The replacement appears in the fleet, ALIVE and healthy.
+    actuator._managed.append(_container("new-1"))
+    twingate._tg.append(_tg("new-1"))
+
+    with structlog.testing.capture_logs() as cap:
+        await loop.run_cycle()
+    assert "c1" in twingate.deleted
+    assert ("deprovision", "c1") in actuator.calls
+    assert metrics.registry.get_sample_value("fc_replacements_total", {"rn": "rn-1"}) == 1.0
+    replace_event = next(e for e in cap if e["event"] == "action.replace")
+    assert replace_event["actor"] == "manual"
+    replace_actions = [a for a in await state.recent_actions(limit=10) if a.action == "replace"]
+    assert replace_actions and replace_actions[0].actor == "manual"
+
+
+async def test_manual_replace_unknown_connector_refused(tmp_path: Path) -> None:
+    # Replacing a Connector not in the current fleet is refused — no provision,
+    # no pending slot.
+    loop, twingate, actuator, _metrics, _state = await _make_loop(
+        tmp_path,
+        containers=[_container("c1"), _container("c2")],
+        tg_connectors=[_tg("c1"), _tg("c2")],
+        collectors=[],
+    )
+    acted = await loop.manual_replace("ghost")
+    assert acted is False
+    assert twingate.created == []
+    assert actuator.calls == []
+    assert "ghost" not in loop._pending_replaces
+
+
+async def test_manual_replace_already_in_flight_refused(tmp_path: Path) -> None:
+    # A second manual replace for a connector already mid-replace is a no-op
+    # (no duplicate replacement).
+    loop, twingate, _actuator, _metrics, _state = await _make_loop(
+        tmp_path,
+        containers=[_container("c1"), _container("c2")],
+        tg_connectors=[_tg("c1"), _tg("c2")],
+        collectors=[],
+    )
+    assert await loop.manual_replace("c1") is True
+    assert await loop.manual_replace("c1") is False
+    assert twingate.created == ["new-1"]  # only one replacement ever provisioned

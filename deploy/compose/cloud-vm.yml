@@ -1,0 +1,52 @@
+# Fleet Commander — CLOUD VM variant (optional).
+#
+# Tuned for an unattended "a Linux box with Docker" cloud instance, paired with
+# deploy/cloud-init/ (which fetches and runs deploy/bootstrap.sh on first boot):
+#   • restart: always           — survive reboots without an operator
+#   • loopback-only UI/metrics   — reach it via an SSH tunnel or a TLS proxy
+#   • instance-role creds        — prefer the VM's attached role over secrets in
+#                                  .env where a component supports it (e.g. the
+#                                  log-shipper against AWS S3); keep only what
+#                                  must be a secret (TWINGATE_API_KEY) in .env.
+#
+# The root ../../docker-compose.yml is the canonical reference.
+#
+# Run from the repo root (usually invoked by cloud-init via bootstrap.sh):
+#   docker compose -f deploy/compose/cloud-vm.yml up -d
+
+services:
+  fc:
+    build: ../..
+    image: fleet-commander:dev
+    container_name: fc
+    restart: always
+    env_file: ../../.env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../../config/config.yaml:/app/config/config.yaml:ro
+      - fc_state:/app/state
+    ports:
+      - "127.0.0.1:8080:8080"   # never expose a cloud VM's UI/metrics publicly without TLS
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz', timeout=3).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  janus:
+    image: ghcr.io/twingate-solutions/janus-updater-service:latest
+    container_name: fc-janus
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  fc_state:

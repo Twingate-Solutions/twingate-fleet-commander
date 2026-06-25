@@ -53,32 +53,31 @@ _POLICY = Policy.model_validate(
     {
         "poll_interval_seconds": 30,
         "connector_image": "twingate/connector:1",
-        "metrics_port": 9999,
-        "collectors": {"docker_stats": True, "stdout_metrics": False, "prometheus": True},
+        "collectors": {"docker_stats": True, "stdout_metrics": False},
         "labels": {
             "managed": "twingate.fc.managed",
             "remote_network": "twingate.fc.rn",
             "connector_id": "twingate.fc.connector_id",
         },
-        "janus_lock_label": "twingate.janus.upgrading",
-        "defaults": {
-            "min_connectors": 2,
-            "max_connectors": 6,
-            "scale_step": 1,
-            "cpu_high_pct": 75.0,
-            "cpu_low_pct": 25.0,
-            "throughput_high_mbps": 80.0,
-            "throughput_low_mbps": 10.0,
-            "mem_ceiling_bytes": 0,
-            "scale_up_window_seconds": 300,
-            "scale_down_window_seconds": 1200,
-            "scale_up_cooldown_seconds": 600,
-            "scale_down_cooldown_seconds": 1800,
-            "drain_grace_seconds": 120,
-            "max_restarts": 3,
-            "restart_window_seconds": 600,
+        "remote_network_id": "rn-1",
+        "remote_network_name": "aws-prod",
+        "min_connectors": 2,
+        "max_connectors": 6,
+        "scale_step": 1,
+        "scale_metrics": {
+            "cpu": {"high_pct": 75.0, "low_pct": 25.0, "window_seconds": 300, "agg": "avg"},
+            "throughput": {
+                "high_mbps": 80.0,
+                "low_mbps": 10.0,
+                "window_seconds": 1200,
+                "agg": "avg",
+            },
         },
-        "remote_networks": [{"id": "rn-1", "name": "aws-prod"}],
+        "scale_up_cooldown_seconds": 600,
+        "scale_down_cooldown_seconds": 1800,
+        "drain_grace_seconds": 120,
+        "max_restarts": 3,
+        "restart_window_seconds": 600,
     }
 )
 
@@ -89,21 +88,34 @@ class FakeOperator:
     def __init__(self, status: StatusState) -> None:
         self._status = status
         self.scale_calls: list[tuple[str, ScaleDirection]] = []
+        self.replace_calls: list[str] = []
 
     async def manual_scale(self, rn_id: str, direction: ScaleDirection) -> bool:
         self.scale_calls.append((rn_id, direction))
         snap = self._status.get()
         assert snap is not None
-        rn = snap.remote_networks[0]
+        rn = snap.remote_network
         new_count = rn.count + (1 if direction is ScaleDirection.UP else -1)
         connectors = list(rn.connectors)
         if direction is ScaleDirection.UP:
             connectors.append(_connector(f"c{new_count}"))
         updated = rn.model_copy(update={"count": new_count, "connectors": connectors})
-        self._status.publish(snap.model_copy(update={"remote_networks": [updated]}))
+        self._status.publish(snap.model_copy(update={"remote_network": updated}))
         return True
 
     async def manual_cordon(self, connector_id: str, cordoned: bool) -> bool:
+        return True
+
+    async def manual_replace(self, connector_id: str) -> bool:
+        # A manual replace appends a net-new connector (the replacement) without
+        # removing the target yet — the UI should reflect the grown fleet.
+        self.replace_calls.append(connector_id)
+        snap = self._status.get()
+        assert snap is not None
+        rn = snap.remote_network
+        connectors = [*rn.connectors, _connector("c-replacement")]
+        updated = rn.model_copy(update={"count": rn.count + 1, "connectors": connectors})
+        self._status.publish(snap.model_copy(update={"remote_network": updated}))
         return True
 
 
@@ -113,7 +125,6 @@ def _connector(cid: str) -> ConnectorStatus:
         name=cid,
         twingate_state="ALIVE",
         docker_health="healthy",
-        janus_locked=False,
         cordoned=False,
         cpu_pct_norm=40.0,
         throughput_bps=1_000_000.0,
@@ -125,16 +136,14 @@ def _snapshot(count: int = 2) -> FleetSnapshot:
     return FleetSnapshot(
         cycle_id="cyc-1",
         ts=NOW,
-        remote_networks=[
-            RemoteNetworkStatus(
-                rn_id="rn-1",
-                name="aws-prod",
-                count=count,
-                min_connectors=2,
-                max_connectors=6,
-                connectors=[_connector(f"c{i + 1}") for i in range(count)],
-            )
-        ],
+        remote_network=RemoteNetworkStatus(
+            rn_id="rn-1",
+            name="aws-prod",
+            count=count,
+            min_connectors=2,
+            max_connectors=6,
+            connectors=[_connector(f"c{i + 1}") for i in range(count)],
+        ),
     )
 
 
@@ -262,5 +271,26 @@ def test_scale_override_updates_ui(browser: "Browser", tmp_path: Path) -> None:
             assert page.inner_text('[data-testid="count-rn-1"]').startswith("3")
             assert operator.scale_calls == [("rn-1", ScaleDirection.UP)]
             assert page.locator('[data-testid="connector-c3"]').count() == 1
+        finally:
+            page.close()
+
+
+def test_replace_override_updates_ui(browser: "Browser", tmp_path: Path) -> None:
+    app, operator = _make_app(tmp_path, override_enabled=True)
+    port = _free_port()
+    with _ServerThread(app, port):
+        page = browser.new_page()
+        # The Replace button asks for confirmation; auto-accept the dialog.
+        page.on("dialog", lambda dialog: dialog.accept())
+        try:
+            page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
+            page.wait_for_selector('[data-testid="overrides-panel"]', state="visible")
+            # The floor-fill warning is surfaced in the overrides panel.
+            assert "min_connectors" in page.inner_text('[data-testid="floor-fill-warning"]')
+            page.fill("#override-secret", SECRET)
+            page.click('[data-testid="replace-c1"]')
+            # The fake operator appends the replacement; the UI refreshes to show it.
+            page.wait_for_selector('[data-testid="connector-c-replacement"]')
+            assert operator.replace_calls == ["c1"]
         finally:
             page.close()

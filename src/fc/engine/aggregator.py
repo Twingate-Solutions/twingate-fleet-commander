@@ -1,53 +1,76 @@
-"""Per-RN sliding windows over resource samples (short up + long down windows).
+"""Sliding-window aggregation over the resource-sample stream.
 
 The aggregator buffers the recent :class:`~fc.models.ResourceSample` stream per
-connector and, on demand, reduces an arbitrary time window for a set of
-connectors into a :class:`WindowAggregate`. The decider asks for two windows per
-Remote Network — the short scale-up window and the long scale-down window — so
-the asymmetric, sustained-window triggers (Key Design Rule #3) are computed from
-the same buffered history.
+connector and, on demand, reduces a single signal (CPU or throughput) over its
+own trailing window using its own aggregation mode. Fleet Commander manages one
+Remote Network (Key Design Rule N1), and each scale metric carries its own
+window and aggregation (Key Design Rule #3), so the decider asks for one reduced
+value per metric per cycle.
 
 Reduction rules mirror the policy's signal semantics:
 
-* **CPU** averages only the samples that actually carry a normalized CPU value;
-  a ``None`` (e.g. a Prometheus throughput-only sample) is skipped, never
-  treated as zero load.
-* **Throughput** is averaged per connector first and then across connectors, so
-  the result is per-connector tunnel throughput regardless of how many samples
-  each connector contributed — matching the per-connector throughput watermark.
+* **CPU** pools every in-window sample that carries a normalized CPU value
+  across all connectors, then reduces that pool by the metric's ``agg``. A
+  ``None`` (e.g. a throughput-only sample) is skipped, never treated as zero
+  load.
+* **Throughput** is reduced per connector first (over the window, by ``agg``)
+  and then averaged across connectors, so the result is per-connector tunnel
+  throughput regardless of how many samples each connector contributed —
+  matching the per-connector throughput watermark.
+
+The ``agg`` mode is one of ``avg`` (arithmetic mean), ``min``, or ``pNN`` (the
+NN-th percentile, linear interpolation), validated by the config layer.
 """
 
 from collections.abc import Iterable
-from dataclasses import dataclass
 from datetime import datetime, timedelta
+from math import ceil, floor
+from typing import Literal
 
-from fc.models import ManagedConnector, RemoteNetworkView, ResourceSample
+from fc.models import ResourceSample
+
+#: The signals the aggregator can reduce. Mirrors the scale metrics in the policy.
+MetricSignal = Literal["cpu", "throughput"]
 
 
-@dataclass(frozen=True)
-class WindowAggregate:
-    """The reduction of one time window for one set of connectors.
+def reduce_values(values: list[float], agg: str) -> float | None:
+    """Reduce a list of samples to a single value by aggregation mode.
 
-    ``avg_cpu_norm`` and ``avg_throughput_bps`` are ``None`` when no sample in
-    the window carried that signal.
+    Args:
+        values: The in-window sample values (already filtered to the signal).
+        agg: ``avg`` (mean), ``min``, or ``pNN`` (NN-th percentile, 0-100).
+
+    Returns:
+        The reduced value, or ``None`` when ``values`` is empty.
     """
+    if not values:
+        return None
+    if agg == "avg":
+        return sum(values) / len(values)
+    if agg == "min":
+        return min(values)
+    # ``pNN`` — validated by the config layer, so the slice always parses.
+    return _percentile(values, int(agg[1:]))
 
-    avg_cpu_norm: float | None
-    avg_throughput_bps: float | None
-    sample_count: int
-    connectors_with_data: int
 
-
-def _mean(values: list[float]) -> float | None:
-    """Return the arithmetic mean, or ``None`` for an empty list."""
-    return sum(values) / len(values) if values else None
+def _percentile(values: list[float], pct: int) -> float:
+    """Return the ``pct``-th percentile via linear interpolation between ranks."""
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (pct / 100.0) * (len(ordered) - 1)
+    low = floor(rank)
+    high = ceil(rank)
+    if low == high:
+        return ordered[low]
+    return ordered[low] + (ordered[high] - ordered[low]) * (rank - low)
 
 
 class Aggregator:
-    """Buffers resource samples per connector and reduces time windows.
+    """Buffers resource samples per connector and reduces per-metric windows.
 
-    Retains samples for ``retention_seconds`` (set to the longest window in
-    play) so a single buffer serves both the up- and down-windows.
+    Retains samples for ``retention_seconds`` (set to the longest metric window
+    in play) so a single buffer serves every metric's window.
     """
 
     def __init__(self, *, retention_seconds: int) -> None:
@@ -55,8 +78,8 @@ class Aggregator:
 
         Args:
             retention_seconds: How long to keep samples; should be at least the
-                longest decision window so :meth:`prune` never drops data a
-                window still needs.
+                longest metric window so :meth:`prune` never drops data a window
+                still needs.
         """
         self._retention_seconds = retention_seconds
         self._samples: dict[str, list[ResourceSample]] = {}
@@ -85,89 +108,96 @@ class Aggregator:
             else:
                 del self._samples[connector_id]
 
-    def window_aggregate(
-        self, connector_ids: Iterable[str], *, window_seconds: int, now: datetime
-    ) -> WindowAggregate:
-        """Reduce one window for the given connectors.
+    def reduce(
+        self,
+        connector_ids: Iterable[str],
+        *,
+        signal: MetricSignal,
+        window_seconds: int,
+        agg: str,
+        now: datetime,
+    ) -> float | None:
+        """Reduce one signal over its own window for the given connectors.
 
         Args:
-            connector_ids: The connectors that belong to this Remote Network.
-            window_seconds: Window length ending at ``now``.
+            connector_ids: The connectors that belong to the Remote Network.
+            signal: ``"cpu"`` (per-effective-core normalized percent) or
+                ``"throughput"`` (per-connector bytes/sec).
+            window_seconds: Trailing window length ending at ``now``.
+            agg: Aggregation mode (``avg``/``min``/``pNN``).
             now: The window's end (current time).
 
         Returns:
-            The :class:`WindowAggregate` for the window.
+            The reduced value for the metric, or ``None`` when no sample in the
+            window carried that signal.
         """
         cutoff = now - timedelta(seconds=window_seconds)
         ids = set(connector_ids)
 
-        cpu_values: list[float] = []
-        per_connector_throughput: list[float] = []
-        sample_count = 0
+        if signal == "cpu":
+            cpu_values = [
+                sample.cpu_pct_norm
+                for connector_id in ids
+                for sample in self._samples.get(connector_id, [])
+                if sample.ts >= cutoff and sample.cpu_pct_norm is not None
+            ]
+            return reduce_values(cpu_values, agg)
 
+        # Throughput: reduce each connector's series by ``agg`` over the window,
+        # then average across connectors to get per-connector tunnel throughput.
+        per_connector: list[float] = []
         for connector_id in ids:
-            connector_throughput: list[float] = []
-            for sample in self._samples.get(connector_id, []):
-                if sample.ts < cutoff:
-                    continue
-                sample_count += 1
-                if sample.cpu_pct_norm is not None:
-                    cpu_values.append(sample.cpu_pct_norm)
-                if sample.throughput_bps is not None:
-                    connector_throughput.append(sample.throughput_bps)
-            connector_mean = _mean(connector_throughput)
-            if connector_mean is not None:
-                per_connector_throughput.append(connector_mean)
+            connector_values = [
+                sample.throughput_bps
+                for sample in self._samples.get(connector_id, [])
+                if sample.ts >= cutoff and sample.throughput_bps is not None
+            ]
+            reduced = reduce_values(connector_values, agg)
+            if reduced is not None:
+                per_connector.append(reduced)
+        return reduce_values(per_connector, "avg")
 
-        return WindowAggregate(
-            avg_cpu_norm=_mean(cpu_values),
-            avg_throughput_bps=_mean(per_connector_throughput),
-            sample_count=sample_count,
-            connectors_with_data=len(per_connector_throughput),
-        )
-
-    def build_view(
+    def reduce_per_connector(
         self,
+        connector_ids: Iterable[str],
         *,
-        rn_id: str,
-        name: str,
-        connectors: list[ManagedConnector],
-        up_window_seconds: int,
-        down_window_seconds: int,
+        signal: MetricSignal,
+        window_seconds: int,
+        agg: str,
         now: datetime,
-    ) -> RemoteNetworkView:
-        """Build a :class:`RemoteNetworkView` with both windows' aggregates.
+    ) -> dict[str, float]:
+        """Reduce one signal over its own window, per connector (no averaging).
 
-        The aggregates dict carries only the present (non-``None``) numbers, so
-        a consumer can use ``.get(...)`` to distinguish "no signal" from a real
-        value. Keys: ``up_cpu_norm``, ``up_throughput_bps``, ``down_cpu_norm``,
-        ``down_throughput_bps``, and ``connector_count``.
+        Unlike :meth:`reduce` (which pools/averages into a single fleet value),
+        this returns each connector's *own* windowed reduced value, so the
+        decider can see the per-connector spread and apply the sticky-connector
+        ``scale_up_trigger`` (``any``/``quorum``). The same per-connector
+        reduction used for throughput in :meth:`reduce` is applied here to CPU
+        as well.
 
         Args:
-            rn_id: Remote Network id.
-            name: Remote Network name.
-            connectors: The managed Connectors in this Remote Network.
-            up_window_seconds: Short scale-up window.
-            down_window_seconds: Long scale-down window.
-            now: Current time.
+            connector_ids: The connectors that belong to the Remote Network.
+            signal: ``"cpu"`` (per-effective-core normalized percent) or
+                ``"throughput"`` (per-connector bytes/sec).
+            window_seconds: Trailing window length ending at ``now``.
+            agg: Aggregation mode (``avg``/``min``/``pNN``).
+            now: The window's end (current time).
 
         Returns:
-            The assembled view.
+            A map of connector id → that connector's reduced windowed value.
+            Connectors with no in-window sample carrying the signal are omitted.
         """
-        ids = [c.connector_id for c in connectors]
-        up = self.window_aggregate(ids, window_seconds=up_window_seconds, now=now)
-        down = self.window_aggregate(ids, window_seconds=down_window_seconds, now=now)
-
-        aggregates: dict[str, float] = {"connector_count": float(len(connectors))}
-        if up.avg_cpu_norm is not None:
-            aggregates["up_cpu_norm"] = up.avg_cpu_norm
-        if up.avg_throughput_bps is not None:
-            aggregates["up_throughput_bps"] = up.avg_throughput_bps
-        if down.avg_cpu_norm is not None:
-            aggregates["down_cpu_norm"] = down.avg_cpu_norm
-        if down.avg_throughput_bps is not None:
-            aggregates["down_throughput_bps"] = down.avg_throughput_bps
-
-        return RemoteNetworkView(
-            rn_id=rn_id, name=name, connectors=connectors, aggregates=aggregates
-        )
+        cutoff = now - timedelta(seconds=window_seconds)
+        result: dict[str, float] = {}
+        for connector_id in set(connector_ids):
+            values = [
+                value
+                for sample in self._samples.get(connector_id, [])
+                if sample.ts >= cutoff
+                for value in (sample.cpu_pct_norm if signal == "cpu" else sample.throughput_bps,)
+                if value is not None
+            ]
+            reduced = reduce_values(values, agg)
+            if reduced is not None:
+                result[connector_id] = reduced
+        return result

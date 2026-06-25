@@ -218,8 +218,8 @@ def _node_to_connector(node: dict[str, Any]) -> ManagedConnector:
     """Map a GraphQL connector node onto a :class:`ManagedConnector`.
 
     Only the API-known fields are populated. ``container_id``,
-    ``docker_health``, ``janus_locked``, and ``cordoned`` are not knowable from
-    the Admin API and keep their model defaults.
+    ``docker_health``, and ``cordoned`` are not knowable from the Admin API and
+    keep their model defaults.
 
     Args:
         node: The ``node`` object from a ``connectors`` edge or single lookup.

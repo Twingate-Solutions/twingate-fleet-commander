@@ -18,18 +18,13 @@ import contextlib
 import signal
 from pathlib import Path
 
-import aiodocker
 import httpx
 import structlog
 import uvicorn
 
-from fc.actuator.docker_actuator import DockerActuator
+from fc.actuator.factory import build_platform
 from fc.api.app import Readiness, create_app
 from fc.api.routes import create_status_router
-from fc.collectors.base import Collector
-from fc.collectors.docker_stats import DockerStatsCollector
-from fc.collectors.prometheus import PrometheusCollector
-from fc.collectors.stdout_metrics import StdoutMetricsCollector
 from fc.config import Policy, Settings, load_policy
 from fc.engine.aggregator import Aggregator
 from fc.loop import ControlLoop
@@ -49,32 +44,15 @@ _STATIC_DIR = Path(__file__).resolve().parent / "web" / "static"
 
 
 def _retention_seconds(policy: Policy) -> int:
-    """Pick the aggregator retention: the longest scale-down window in play.
+    """Pick the aggregator retention: the longest per-metric window in play.
 
-    The aggregator must keep samples at least as long as the longest decision
-    window so the down-window reduction never drops data it still needs.
+    The aggregator must keep samples at least as long as the longest metric
+    window so a metric's reduction never drops data it still needs.
     """
-    windows = [policy.defaults.scale_down_window_seconds]
-    windows += [
-        rn.scale_down_window_seconds
-        for rn in policy.remote_networks
-        if rn.scale_down_window_seconds is not None
-    ]
-    return max(windows)
-
-
-def _build_collectors(
-    policy: Policy, docker: aiodocker.Docker, http: httpx.AsyncClient
-) -> list[Collector]:
-    """Construct the enabled collectors per the policy toggles, in priority order."""
-    collectors: list[Collector] = []
-    if policy.collectors.docker_stats:
-        collectors.append(DockerStatsCollector(docker))
-    if policy.collectors.stdout_metrics:
-        collectors.append(StdoutMetricsCollector(docker))
-    if policy.collectors.prometheus:
-        collectors.append(PrometheusCollector(http, port=policy.metrics_port))
-    return collectors
+    return max(
+        policy.scale_metrics.cpu.window_seconds,
+        policy.scale_metrics.throughput.window_seconds,
+    )
 
 
 async def _amain() -> None:
@@ -89,17 +67,13 @@ async def _amain() -> None:
     await state.init()
 
     http = httpx.AsyncClient()
-    docker = aiodocker.Docker(url=settings.docker_host)
     twingate = TwingateClient(settings.twingate_network, settings.twingate_api_key, client=http)
-    actuator = DockerActuator(
-        docker,
-        network=settings.twingate_network,
-        image=policy.connector_image,
-        labels=policy.labels,
-        metrics_port=policy.metrics_port,
-        janus_lock_label=policy.janus_lock_label,
-    )
-    collectors = _build_collectors(policy, docker, http)
+    # The actuator + collectors are chosen by FC_PLATFORM (docker | ecs | aci);
+    # the factory wires the matching backend and (for docker) the shared inspect
+    # cache. compute_probe feeds /readyz; aclose tears down any backend client.
+    platform = build_platform(settings, policy, http=http)
+    actuator = platform.actuator
+    collectors = platform.collectors
     aggregator = Aggregator(retention_seconds=_retention_seconds(policy))
     metrics = Metrics()
     status_state = StatusState()
@@ -116,7 +90,7 @@ async def _amain() -> None:
     )
 
     readiness = Readiness(
-        docker_probe=docker.version,
+        docker_probe=platform.compute_probe,
         twingate_probe=twingate.list_remote_networks,
     )
     status_router = create_status_router(
@@ -146,12 +120,25 @@ async def _amain() -> None:
     stop_event = asyncio.Event()
     _install_signal_handlers(stop_event, server)
 
+    if settings.fc_override_enabled:
+        # The override secret travels in a request header in clear text. The
+        # server binds 0.0.0.0 inside the container; the loopback/TLS boundary is
+        # enforced by the compose port mapping (127.0.0.1 by default). Make the
+        # requirement loud so an operator who exposes the port does so knowingly.
+        logger.warning(
+            "manager.overrides_enabled",
+            detail=(
+                "manual override endpoints are ENABLED — the shared secret is sent in the "
+                "X-FC-Override-Secret header; expose this port only behind a TLS proxy or "
+                "over loopback, never plain HTTP on a public interface"
+            ),
+        )
     logger.info("manager.start", http_port=_HTTP_PORT, poll_interval=policy.poll_interval_seconds)
     try:
         await asyncio.gather(loop.run_forever(stop_event), server.serve())
     finally:
+        await platform.aclose()
         await http.aclose()
-        await docker.close()
         logger.info("manager.stop")
 
 

@@ -10,8 +10,10 @@
 # Provide secrets via the environment (don't hardcode the API key in an image):
 #   TWINGATE_NETWORK=acme \
 #   TWINGATE_API_KEY=tgp_xxxxxxxx \
-#   SEED_RN_ID=UmVtb3RlTmV0d29yazoxMjM= \
 #   ./proxmox-generic.sh
+#
+# FC self-provisions its Connectors; set the Remote Network it manages in
+# config/config.yaml (remote_network_id). There are no seed connectors.
 
 set -euo pipefail
 
@@ -37,5 +39,5 @@ elif [ ! -d "${INSTALL_DIR}" ]; then
   git clone "${REPO_URL}" "${INSTALL_DIR}"
 fi
 
-# --- hand off to the real bootstrap (passes through TWINGATE_* / SEED_RN_ID / FC_SKIP_SEED) ---
+# --- hand off to the real bootstrap (passes through TWINGATE_NETWORK / TWINGATE_API_KEY) ---
 exec "${INSTALL_DIR}/deploy/bootstrap.sh"

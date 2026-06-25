@@ -7,14 +7,15 @@
 # Secrets: do NOT inline TWINGATE_API_KEY here (user-data is readable via the
 # instance metadata service). Store it in SSM Parameter Store as a SecureString and
 # give the instance an IAM role allowing ssm:GetParameter, then fetch it at boot
-# (shown below). TWINGATE_NETWORK and SEED_RN_ID are not secret.
+# (shown below). TWINGATE_NETWORK is not secret. FC self-provisions its
+# Connectors — set the Remote Network it manages in config/config.yaml
+# (remote_network_id), not here.
 
 write_files:
   - path: /etc/fc.env
     permissions: '0600'
     content: |
       TWINGATE_NETWORK=acme
-      SEED_RN_ID=UmVtb3RlTmV0d29yazoxMjM=
       # TWINGATE_API_KEY is fetched from SSM at runcmd time.
 
 runcmd:

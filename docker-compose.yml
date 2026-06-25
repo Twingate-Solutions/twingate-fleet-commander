@@ -2,17 +2,18 @@
 #
 # Brings up, on a single Docker host:
 #   • fc          — the manager (this project): control loop + status UI + /metrics
-#   • janus       — the connector version-updater (FC yields to it via a lock label)
+#   • janus       — the connector version-updater (no lock; FC enrols connectors via labels)
 #   • log-shipper — OPTIONAL stdout->SIEM shipper, behind the `shipping` profile
 #
-# FC self-provisions its Connectors — there are no seed Connector services. For
-# each configured Remote Network it fills the fleet up to `min_connectors` from
-# empty and scales further on load, minting tokens via the Twingate API and
-# injecting them straight into the containers it runs.
+# FC self-provisions its Connectors — there are no seed Connector services. One FC
+# instance manages exactly one Remote Network (Key Design Rule N1): it fills that
+# RN's fleet up to `min_connectors` from empty and scales further on load, minting
+# tokens via the Twingate API and injecting them straight into the containers it
+# runs.
 #
 # Quick start:
 #   cp .env.example .env                       # fill in TWINGATE_NETWORK + TWINGATE_API_KEY
-#   cp config/config.example.yaml config/config.yaml   # set connector_image + remote_networks
+#   cp config/config.example.yaml config/config.yaml   # set connector_image + remote_network_id
 #   docker compose up -d                       # manager + janus; FC provisions the rest
 #   docker compose --profile shipping up -d    # also start the log-shipper
 #
@@ -48,9 +49,14 @@ services:
       - ./config/config.yaml:/app/config/config.yaml:ro   # read-only: policy can't be rewritten
       - fc_state:/app/state                               # cooldowns + action history (survives restart)
     ports:
-      - "8080:8080"        # status UI + /healthz /readyz /metrics
-      # Hardened: bind to loopback only and front with a TLS proxy:
-      # - "127.0.0.1:8080:8080"
+      # Loopback-only by DEFAULT: the read-only status UI, /metrics, and the
+      # (optional) override endpoints are not reachable off-box. Read it via an
+      # SSH tunnel (`ssh -L 8080:localhost:8080 host`) or front it with a
+      # TLS-terminating reverse proxy. Public exposure is opt-in (next line).
+      - "127.0.0.1:8080:8080"   # status UI + /healthz /readyz /metrics
+      # Public exposure — ONLY behind a TLS proxy, never plain HTTP on a public
+      # interface (the override secret travels in a request header):
+      # - "8080:8080"
     healthcheck:
       # python is already in the image (python:3.12-slim); no curl/wget needed.
       test:
@@ -75,10 +81,12 @@ services:
   # floor itself. The image FC provisions is `config.yaml -> connector_image`.
 
   # ── janus — connector version updater ────────────────────────────────────────
-  # Separate service that upgrades Connector containers in place. FC NEVER fights
-  # janus: when janus marks a container with the upgrade-lock label
-  # (config.yaml -> janus_lock_label), FC skips all scale/health actions on it
-  # for that cycle. Mounts the socket for the same reason FC does.
+  # Separate service that upgrades Connector containers in place whenever a newer
+  # image is published. janus has NO lock: FC enrols every connector it
+  # provisions with janus's auto-update labels (config.yaml -> janus.enabled /
+  # janus.interval_seconds → janus.autoupdate.enable + janus.autoupdate.interval)
+  # and tolerates the brief container recreate an upgrade causes via the
+  # startup-grace / unhealthy-threshold windows. Mounts the socket like FC does.
   janus:
     image: ghcr.io/twingate-solutions/janus-updater-service:latest
     container_name: fc-janus
@@ -87,36 +95,32 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
 
   # ── log-shipper (optional) ───────────────────────────────────────────────────
-  # Ships Connector stdout to a SIEM. Independent of FC — enable only if you don't
-  # already collect container stdout. Start with:  docker compose --profile shipping up -d
+  # Ships Connector real-time analytics / stdout to an S3-compatible bucket.
+  # Independent of FC — enable only if you want to push connector analytics to a
+  # non-AWS S3 bucket (e.g. GCS via S3 interop), which Twingate doesn't do
+  # natively. Start with:  docker compose --profile shipping up -d
+  #
+  # It reads container LOG FILES, not the Docker socket, so it mounts
+  # /var/lib/docker/containers read-only (NOT the socket). Configure it via the
+  # TWINGATE_SHIPPER_* block in .env (see .env.example → "log-shipper" section);
+  # the container filter must match the connector image you provision.
   log-shipper:
     image: ghcr.io/twingate-solutions/twingate-connector-log-shipper:latest
     container_name: fc-log-shipper
     profiles: [ "shipping" ]
     restart: unless-stopped
+    # Scoped env (NOT env_file: .env) so FC's TWINGATE_API_KEY is never handed to
+    # the shipper. Values are substituted from .env at compose time.
+    environment:
+      TWINGATE_SHIPPER_S3_BUCKET: "${TWINGATE_SHIPPER_S3_BUCKET}"
+      TWINGATE_SHIPPER_S3_ACCESS_KEY_ID: "${TWINGATE_SHIPPER_S3_ACCESS_KEY_ID}"
+      TWINGATE_SHIPPER_S3_SECRET_ACCESS_KEY: "${TWINGATE_SHIPPER_S3_SECRET_ACCESS_KEY}"
+      TWINGATE_SHIPPER_S3_ENDPOINT_URL: "${TWINGATE_SHIPPER_S3_ENDPOINT_URL:-}"
+      TWINGATE_SHIPPER_S3_REGION: "${TWINGATE_SHIPPER_S3_REGION:-}"
+      TWINGATE_SHIPPER_S3_PREFIX: "${TWINGATE_SHIPPER_S3_PREFIX:-}"
+      TWINGATE_SHIPPER_DOCKER_CONTAINER_NAME_FILTER: "${TWINGATE_SHIPPER_DOCKER_CONTAINER_NAME_FILTER:-twingate-custom-connector-container}"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-
-  # ── socket-proxy (optional, hardened) ────────────────────────────────────────
-  # Least-privilege alternative to mounting the raw socket into fc/janus. Exposes a
-  # constrained Docker API over tcp://socket-proxy:2375 with only the calls FC needs.
-  # To use: enable this service, set DOCKER_HOST=tcp://socket-proxy:2375 in .env, and
-  # remove the docker.sock bind-mounts from fc (and janus). Start with: --profile hardened
-  # socket-proxy:
-  #   image: ghcr.io/tecnativa/docker-socket-proxy:latest
-  #   container_name: fc-socket-proxy
-  #   profiles: [ "hardened" ]
-  #   restart: unless-stopped
-  #   environment:
-  #     CONTAINERS: 1        # list/inspect
-  #     POST: 1              # allow create/start/stop/restart/remove
-  #     IMAGES: 1            # pull/inspect images for provisioning
-  #     EXEC: 0
-  #     VOLUMES: 0
-  #     NETWORKS: 1
-  #     INFO: 1
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
 
 volumes:
   fc_state:

@@ -34,7 +34,6 @@ class ConnectorStatus(BaseModel):
     name: str
     twingate_state: str | None
     docker_health: str | None
-    janus_locked: bool
     cordoned: bool
     cpu_pct_norm: float | None
     throughput_bps: float | None
@@ -53,11 +52,11 @@ class RemoteNetworkStatus(BaseModel):
 
 
 class FleetSnapshot(BaseModel):
-    """The whole fleet as of one control-loop cycle."""
+    """The fleet of the single managed Remote Network as of one cycle."""
 
     cycle_id: str
     ts: datetime
-    remote_networks: list[RemoteNetworkStatus]
+    remote_network: RemoteNetworkStatus
 
 
 class StatusState:
@@ -131,5 +130,16 @@ class FleetOperator(Protocol):
 
         Returns ``False`` if a cordon was refused because the Connector is not
         in the current fleet; ``True`` otherwise.
+        """
+        ...
+
+    async def manual_replace(self, connector_id: str) -> bool:
+        """Replace a Connector via the cycle-spanning net-new path.
+
+        Provisions the replacement and waits for it to become healthy before the
+        old Connector is drained (so the floor is never breached). Returns
+        ``True`` if the replace was started, ``False`` if the Connector is not in
+        the current fleet, a replace is already in flight, or provisioning the
+        replacement failed.
         """
         ...

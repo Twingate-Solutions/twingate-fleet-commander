@@ -25,6 +25,17 @@
                  placeholder="X-FC-Override-Secret" />
         </label>
         <p class="muted small">Overrides honor the floor and drain-before-delete. Every action is audit-logged.</p>
+        <p class="warn small" data-testid="floor-fill-warning">
+          Floor-fill: manually removing or replacing a connector below
+          <code>min_connectors</code> only triggers FC to auto-fill the Remote Network
+          back up to the floor on the next cycle. To keep the Remote Network smaller,
+          lower <code>min_connectors</code> and restart the manager instead.
+        </p>
+        <p class="warn small" data-testid="tls-warning">
+          The override secret travels in the <code>X-FC-Override-Secret</code> request
+          header — only enable overrides behind a TLS-terminating proxy (or over
+          loopback), never over plain HTTP on an exposed interface.
+        </p>
       </section>
 
       <section id="no-data" class="banner hidden" data-testid="no-data">
