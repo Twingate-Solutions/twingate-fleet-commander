@@ -1,0 +1,23 @@
+#cloud-config
+# AWS EC2 first-boot bootstrap for Fleet Commander.
+#
+# Pass this as the instance "User data". The Docker engine itself is installed by
+# bootstrap.sh, so a bare Amazon Linux 2023 / Ubuntu AMI is fine.
+#
+# Secrets: do NOT inline TWINGATE_API_KEY here (user-data is readable via the
+# instance metadata service). Store it in SSM Parameter Store as a SecureString and
+# give the instance an IAM role allowing ssm:GetParameter, then fetch it at boot
+# (shown below). TWINGATE_NETWORK and SEED_RN_ID are not secret.
+
+write_files:
+  - path: /etc/fc.env
+    permissions: '0600'
+    content: |
+      TWINGATE_NETWORK=acme
+      SEED_RN_ID=UmVtb3RlTmV0d29yazoxMjM=
+      # TWINGATE_API_KEY is fetched from SSM at runcmd time.
+
+runcmd:
+  - [ bash, -c, "command -v git >/dev/null || (command -v dnf >/dev/null && dnf install -y git) || (apt-get update && apt-get install -y git)" ]
+  - [ bash, -c, "git clone REPO_URL /opt/fleet-commander" ]
+  - [ bash, -c, "TWINGATE_API_KEY=$(aws ssm get-parameter --name /twingate/fc/api_key --with-decryption --query Parameter.Value --output text) && export TWINGATE_API_KEY && set -a && . /etc/fc.env && set +a && /opt/fleet-commander/deploy/bootstrap.sh" ]

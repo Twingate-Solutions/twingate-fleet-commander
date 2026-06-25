@@ -1,0 +1,28 @@
+#cloud-config
+# GCP Compute Engine first-boot bootstrap for Fleet Commander.
+#
+# Attach as the `user-data` metadata key on the instance, e.g.:
+#   gcloud compute instances create fc-host \
+#     --image-family=ubuntu-2404-lts --image-project=ubuntu-os-cloud \
+#     --metadata-from-file user-data=deploy/cloud-init/gcp-compute.yaml \
+#     --scopes=cloud-platform
+#
+# Secrets: prefer fetching TWINGATE_API_KEY from Secret Manager at boot using the
+# instance's service account, rather than inlining it. TWINGATE_NETWORK / SEED_RN_ID
+# are not secret.
+
+write_files:
+  - path: /etc/fc.env
+    permissions: '0600'
+    content: |
+      TWINGATE_NETWORK=acme
+      SEED_RN_ID=UmVtb3RlTmV0d29yazoxMjM=
+      # Recommended: pull from Secret Manager instead of inlining.
+      # TWINGATE_API_KEY=tgp_xxxxxxxx
+
+runcmd:
+  - [ bash, -c, "apt-get update && apt-get install -y git" ]
+  - [ bash, -c, "git clone REPO_URL /opt/fleet-commander" ]
+  # With the gcloud SDK and a Secret Manager accessor role, fetch the key first:
+  # - [ bash, -c, "echo TWINGATE_API_KEY=$(gcloud secrets versions access latest --secret=fc-api-key) >> /etc/fc.env" ]
+  - [ bash, -c, "set -a && . /etc/fc.env && set +a && /opt/fleet-commander/deploy/bootstrap.sh" ]

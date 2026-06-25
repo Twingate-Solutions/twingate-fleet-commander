@@ -1,0 +1,25 @@
+#cloud-config
+# Azure VM first-boot bootstrap for Fleet Commander.
+#
+# Pass this as the VM "custom-data" (cloud-init). A bare Ubuntu Server image is fine;
+# bootstrap.sh installs Docker.
+#
+# Secrets: prefer fetching TWINGATE_API_KEY from Azure Key Vault at boot using the
+# VM's managed identity (requires the Azure CLI on the image, or use a Key Vault VM
+# extension), rather than inlining it below. TWINGATE_NETWORK / SEED_RN_ID are not secret.
+
+write_files:
+  - path: /etc/fc.env
+    permissions: '0600'
+    content: |
+      TWINGATE_NETWORK=acme
+      SEED_RN_ID=UmVtb3RlTmV0d29yazoxMjM=
+      # Recommended: pull from Key Vault instead of inlining.
+      # TWINGATE_API_KEY=tgp_xxxxxxxx
+
+runcmd:
+  - [ bash, -c, "apt-get update && apt-get install -y git" ]
+  - [ bash, -c, "git clone REPO_URL /opt/fleet-commander" ]
+  # With managed identity + Azure CLI on the image, fetch the key first:
+  # - [ bash, -c, "az login --identity && echo TWINGATE_API_KEY=$(az keyvault secret show --vault-name my-vault --name fc-api-key --query value -o tsv) >> /etc/fc.env" ]
+  - [ bash, -c, "set -a && . /etc/fc.env && set +a && /opt/fleet-commander/deploy/bootstrap.sh" ]

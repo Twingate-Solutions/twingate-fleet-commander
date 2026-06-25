@@ -1,0 +1,122 @@
+# Fleet Commander — the managed stack.
+#
+# Brings up, on a single Docker host:
+#   • fc          — the manager (this project): control loop + status UI + /metrics
+#   • janus       — the connector version-updater (FC yields to it via a lock label)
+#   • log-shipper — OPTIONAL stdout->SIEM shipper, behind the `shipping` profile
+#
+# FC self-provisions its Connectors — there are no seed Connector services. For
+# each configured Remote Network it fills the fleet up to `min_connectors` from
+# empty and scales further on load, minting tokens via the Twingate API and
+# injecting them straight into the containers it runs.
+#
+# Quick start:
+#   cp .env.example .env                       # fill in TWINGATE_NETWORK + TWINGATE_API_KEY
+#   cp config/config.example.yaml config/config.yaml   # set connector_image + remote_networks
+#   docker compose up -d                       # manager + janus; FC provisions the rest
+#   docker compose --profile shipping up -d    # also start the log-shipper
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# SECURITY — why the manager mounts the Docker socket, and what it costs.
+#
+# FC's actuator drives the *local* Docker socket to run / stop / restart / remove
+# Connector containers. Mounting /var/run/docker.sock therefore grants FC control
+# of the Docker daemon, which is ROOT-EQUIVALENT on the host: anything that can
+# talk to the socket can start a privileged container and own the box.
+#
+# Mitigations (see the "Docker socket is root-equivalent" note in README.md):
+#   • Treat this host as a trusted control-plane node; don't co-locate untrusted workloads.
+#   • Bind port 8080 to a trusted/loopback interface behind a TLS-terminating proxy;
+#     never expose the status UI / override endpoints to the public internet.
+#   • For hardened deployments, put a read-mostly Docker-socket PROXY in front of the
+#     daemon and point DOCKER_HOST at it, allowlisting only the container-lifecycle
+#     calls FC needs (see the commented `socket-proxy` service below).
+#   • The config volume is mounted read-only so a compromised loop can't rewrite policy.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  fc:
+    build: .
+    image: fleet-commander:dev
+    container_name: fc
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Root-equivalent: required so the actuator can run/stop/rm Connector containers.
+      # Swap for `tcp://socket-proxy:2375` (see below) to harden.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config/config.yaml:/app/config/config.yaml:ro   # read-only: policy can't be rewritten
+      - fc_state:/app/state                               # cooldowns + action history (survives restart)
+    ports:
+      - "8080:8080"        # status UI + /healthz /readyz /metrics
+      # Hardened: bind to loopback only and front with a TLS proxy:
+      # - "127.0.0.1:8080:8080"
+    healthcheck:
+      # python is already in the image (python:3.12-slim); no curl/wget needed.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz', timeout=3).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # ── No seed Connectors ───────────────────────────────────────────────────────
+  # FC self-provisions its fleet: for every configured Remote Network it brings
+  # the Connector count up to `min_connectors` from empty (connectorCreate ->
+  # connectorGenerateTokens -> docker run, with tokens injected straight into the
+  # new container — never written to .env), then scales further on load. So no
+  # pre-seeded Connector containers are needed; start the manager and it fills the
+  # floor itself. The image FC provisions is `config.yaml -> connector_image`.
+
+  # ── janus — connector version updater ────────────────────────────────────────
+  # Separate service that upgrades Connector containers in place. FC NEVER fights
+  # janus: when janus marks a container with the upgrade-lock label
+  # (config.yaml -> janus_lock_label), FC skips all scale/health actions on it
+  # for that cycle. Mounts the socket for the same reason FC does.
+  janus:
+    image: ghcr.io/twingate-solutions/janus-updater-service:latest
+    container_name: fc-janus
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # ── log-shipper (optional) ───────────────────────────────────────────────────
+  # Ships Connector stdout to a SIEM. Independent of FC — enable only if you don't
+  # already collect container stdout. Start with:  docker compose --profile shipping up -d
+  log-shipper:
+    image: ghcr.io/twingate-solutions/twingate-connector-log-shipper:latest
+    container_name: fc-log-shipper
+    profiles: [ "shipping" ]
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # ── socket-proxy (optional, hardened) ────────────────────────────────────────
+  # Least-privilege alternative to mounting the raw socket into fc/janus. Exposes a
+  # constrained Docker API over tcp://socket-proxy:2375 with only the calls FC needs.
+  # To use: enable this service, set DOCKER_HOST=tcp://socket-proxy:2375 in .env, and
+  # remove the docker.sock bind-mounts from fc (and janus). Start with: --profile hardened
+  # socket-proxy:
+  #   image: ghcr.io/tecnativa/docker-socket-proxy:latest
+  #   container_name: fc-socket-proxy
+  #   profiles: [ "hardened" ]
+  #   restart: unless-stopped
+  #   environment:
+  #     CONTAINERS: 1        # list/inspect
+  #     POST: 1              # allow create/start/stop/restart/remove
+  #     IMAGES: 1            # pull/inspect images for provisioning
+  #     EXEC: 0
+  #     VOLUMES: 0
+  #     NETWORKS: 1
+  #     INFO: 1
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock:ro
+
+volumes:
+  fc_state:

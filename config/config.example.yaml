@@ -1,0 +1,45 @@
+# Fleet Commander — non-secret policy configuration.
+# Copy to config/config.yaml. Secrets belong in .env, never here.
+
+poll_interval_seconds: 30
+connector_image: "twingate/connector:1"   # image used when provisioning
+metrics_port: 9999                          # connector :9999 scrape port
+
+collectors:
+  docker_stats: true        # default; works on any image
+  stdout_metrics: false     # custom image only; opt-in
+  prometheus: true          # primary throughput signal
+
+labels:                     # Docker labels FC sets/reads to identify managed connectors
+  managed: "twingate.fc.managed"
+  remote_network: "twingate.fc.rn"
+  connector_id: "twingate.fc.connector_id"
+janus_lock_label: "twingate.janus.upgrading"   # if present on a container, FC yields
+
+defaults:                   # applied to every Remote Network unless overridden below
+  min_connectors: 2         # hard floor — never breached by scale-down
+  max_connectors: 6
+  scale_step: 1
+  cpu_high_pct: 75          # normalized (avg core utilization)
+  cpu_low_pct: 25
+  throughput_high_mbps: 80  # per-connector tunnel throughput
+  throughput_low_mbps: 10
+  mem_ceiling_bytes: 0      # 0 = advisory only (no mem-based action)
+  scale_up_window_seconds: 300      # short — react fast
+  scale_down_window_seconds: 1200   # long — react slowly
+  scale_up_cooldown_seconds: 600
+  scale_down_cooldown_seconds: 1800
+  drain_grace_seconds: 120          # wait after connectorDelete before stop/rm
+  max_restarts: 3                   # within restart_window before replace
+  restart_window_seconds: 600
+  startup_grace_seconds: 90         # don't restart a just-provisioned connector
+                                    # before its first heartbeat (0 disables)
+
+remote_networks:            # per-RN overrides (inherit from defaults)
+  - id: "UmVtb3RlTmV0d29yazoxMjM="
+    name: "aws-prod"
+    min_connectors: 3
+    max_connectors: 10
+  - id: "UmVtb3RlTmV0d29yazo0NTY="
+    name: "office"
+    # inherits all defaults

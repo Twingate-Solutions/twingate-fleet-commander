@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Fleet Commander</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>Fleet Commander</h1>
+      <div class="meta">
+        <span id="cycle-id" class="muted">cycle: —</span>
+        <span id="updated" class="muted">updated: —</span>
+        <span id="poll" class="badge">live</span>
+      </div>
+    </header>
+
+    <main>
+      <section id="overrides-panel" class="card hidden" data-testid="overrides-panel">
+        <h2>Manual overrides</h2>
+        <label class="secret-label">
+          Override secret
+          <input id="override-secret" type="password" autocomplete="off"
+                 placeholder="X-FC-Override-Secret" />
+        </label>
+        <p class="muted small">Overrides honor the floor and drain-before-delete. Every action is audit-logged.</p>
+      </section>
+
+      <section id="no-data" class="banner hidden" data-testid="no-data">
+        Waiting for the first control-loop cycle…
+      </section>
+
+      <section id="fleet" data-testid="fleet"></section>
+
+      <div class="columns">
+        <section class="card">
+          <h2>Recent actions</h2>
+          <table class="data" data-testid="actions">
+            <thead>
+              <tr><th>time</th><th>rn</th><th>action</th><th>outcome</th><th>actor</th><th>reason</th></tr>
+            </thead>
+            <tbody id="actions-body"></tbody>
+          </table>
+        </section>
+
+        <section class="card">
+          <h2>Recent events</h2>
+          <ul id="events-body" class="events" data-testid="events"></ul>
+        </section>
+      </div>
+
+      <section class="card">
+        <h2>Effective config</h2>
+        <pre id="config" class="config" data-testid="config"></pre>
+      </section>
+    </main>
+
+    <!-- Non-executable data block: the initial render payload. Read (not run)
+         by app.js, so a strict CSP (default-src 'self', no 'unsafe-inline')
+         needs no inline script. ``tojson`` escapes </script and HTML metachars. -->
+    <script id="fc-bootstrap" type="application/json">{{ data | tojson }}</script>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
