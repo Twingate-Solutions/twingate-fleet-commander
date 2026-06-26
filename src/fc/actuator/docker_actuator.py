@@ -205,6 +205,11 @@ class DockerActuator:
             "Image": self._image,
             "Env": [
                 f"TWINGATE_NETWORK={self._network}",
+                # Always-on connector analytics: emits ANALYTICS network-traffic
+                # lines on stdout so the stdout_metrics collector and the optional
+                # log-shipper have flow data to read. Hard-coded for every
+                # connector FC provisions; the admin chooses whether to consume it.
+                "TWINGATE_LOG_ANALYTICS=v2",
                 f"TWINGATE_ACCESS_TOKEN={tokens.access_token.get_secret_value()}",
                 f"TWINGATE_REFRESH_TOKEN={tokens.refresh_token.get_secret_value()}",
             ],

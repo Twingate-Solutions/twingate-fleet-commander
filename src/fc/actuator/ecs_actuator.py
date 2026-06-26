@@ -184,7 +184,13 @@ class EcsActuator:
             "name": self._settings.container_name,
             "image": self._image,
             "essential": True,
-            "environment": [{"name": "TWINGATE_NETWORK", "value": self._network}],
+            "environment": [
+                {"name": "TWINGATE_NETWORK", "value": self._network},
+                # Always-on connector analytics (ANALYTICS stdout traffic lines) so
+                # the stdout collector / log-shipper have flow data. Non-secret and
+                # static, so it lives in the reused task definition.
+                {"name": "TWINGATE_LOG_ANALYTICS", "value": "v2"},
+            ],
         }
         if self._settings.log_group:
             container_def["logConfiguration"] = {

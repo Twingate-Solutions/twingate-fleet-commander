@@ -158,6 +158,9 @@ async def test_provision_registers_sizing_and_runs_with_tokens_and_tags() -> Non
     assert register["containerDefinitions"][0]["image"].endswith(
         "custom-connector-container:latest"
     )
+    # Analytics is always-on, baked into the reused task definition's env.
+    td_env = _env_map(register["containerDefinitions"][0]["environment"])
+    assert td_env["TWINGATE_LOG_ANALYTICS"] == "v2"
 
     run = next(kw for op, kw in ecs.calls if op == "run")
     assert run["cluster"] == "fc-cluster"

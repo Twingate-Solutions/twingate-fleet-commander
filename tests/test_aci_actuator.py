@@ -116,6 +116,8 @@ async def test_provision_puts_group_with_sizing_tokens_and_tags() -> None:
     assert container["resources"]["requests"] == {"cpu": 1.0, "memoryInGB": 2.0}
     env = {e["name"]: e for e in container["environmentVariables"]}
     assert env["TWINGATE_NETWORK"]["value"] == "acme"
+    # Analytics is always-on, injected as a plain (non-secret) value.
+    assert env["TWINGATE_LOG_ANALYTICS"]["value"] == "v2"
     # Tokens are injected as secureValue (write-only; never read back).
     assert env["TWINGATE_ACCESS_TOKEN"]["secureValue"] == ACCESS
     assert env["TWINGATE_REFRESH_TOKEN"]["secureValue"] == REFRESH

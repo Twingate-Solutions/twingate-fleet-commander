@@ -105,7 +105,7 @@ services:
   # TWINGATE_SHIPPER_* block in .env (see .env.example → "log-shipper" section);
   # the container filter must match the connector image you provision.
   log-shipper:
-    image: ghcr.io/twingate-solutions/twingate-connector-log-shipper:latest
+    image: ghcr.io/twingate-solutions/twingate-log-shipper:1
     container_name: fc-log-shipper
     profiles: [ "shipping" ]
     restart: unless-stopped

@@ -187,6 +187,10 @@ class AciActuator:
                 "resources": {"requests": {"cpu": _ACI_CPU_CORES, "memoryInGB": _ACI_MEM_GB}},
                 "environmentVariables": [
                     {"name": "TWINGATE_NETWORK", "value": self._network},
+                    # Always-on connector analytics: ANALYTICS stdout traffic lines
+                    # for the stdout collector / log-shipper. Non-secret, so it uses
+                    # a plain ``value`` (not ``secureValue``).
+                    {"name": "TWINGATE_LOG_ANALYTICS", "value": "v2"},
                     {
                         "name": "TWINGATE_ACCESS_TOKEN",
                         "secureValue": tokens.access_token.get_secret_value(),

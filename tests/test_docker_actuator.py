@@ -140,6 +140,8 @@ async def test_provision_sets_env_labels_sysctl_and_restart_policy() -> None:
     assert config["Image"] == "twingate/connector:1"
     env = config["Env"]
     assert "TWINGATE_NETWORK=acme" in env
+    # Analytics is always-on for every provisioned connector.
+    assert "TWINGATE_LOG_ANALYTICS=v2" in env
     assert f"TWINGATE_ACCESS_TOKEN={ACCESS}" in env
     assert f"TWINGATE_REFRESH_TOKEN={REFRESH}" in env
 
