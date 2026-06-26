@@ -36,3 +36,18 @@ docker compose -f deploy/compose/minimal.yml -f deploy/compose/desktop-dev.yml u
 
 > **Validate before deploying:** `docker compose -f deploy/compose/<file>.yml config` renders
 > the merged, variable-substituted config so you can eyeball it without starting anything.
+
+## Tearing a variant down cleanly
+
+FC's Connector containers are **not** compose-managed, so `docker compose down` alone would
+orphan them (still running, still registered in the tenant). Drain the fleet first with the
+`fc-teardown` entrypoint, then bring the stack down:
+
+```bash
+docker compose -f deploy/compose/<file>.yml exec fc fc-teardown   # drain + remove every Connector
+docker compose -f deploy/compose/<file>.yml down -v
+```
+
+`fc-teardown` bypasses the `min_connectors` floor (the whole deployment is going away) and is
+the **only** path that tears down the data plane — a routine `restart`/recreate of `fc` leaves
+the Connectors running.

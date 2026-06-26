@@ -58,6 +58,7 @@ dev = [
 
 [project.scripts]
 fc = "fc.main:run"
+fc-teardown = "fc.main:teardown"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -205,6 +205,7 @@ async def _make_loop(
     policy: Policy | None = None,
     status: StatusState | None = None,
     clock: Any = None,
+    sleep: Any = None,
 ) -> tuple[ControlLoop, FakeTwingate, FakeActuator, Metrics, StateStore]:
     state = StateStore(tmp_path / "state.sqlite3")
     await state.init()
@@ -222,7 +223,7 @@ async def _make_loop(
         clock=clock or (lambda: NOW),
         name_factory=lambda rn: f"{rn}-new",
         id_factory=lambda: "cycle-1",
-        sleep=_noop_sleep,
+        sleep=sleep or _noop_sleep,
         status=status,
     )
     return loop, twingate, actuator, metrics, state
@@ -304,6 +305,9 @@ async def test_scale_down_drains_before_delete(tmp_path: Path) -> None:
     assert result.decisions[0].direction is ScaleDirection.DOWN
     # Logical delete (stop routing) happens before the container is removed.
     victim = twingate.deleted[0]
+    # The container stop/rm is deferred to the background drain (ISSUE-002);
+    # await it so the drain-before-delete ordering can be asserted.
+    await loop.await_pending_drains()
     assert actuator.calls == [("deprovision", victim)]
     assert twingate.deleted == [victim]
     assert (
@@ -314,6 +318,81 @@ async def test_scale_down_drains_before_delete(tmp_path: Path) -> None:
     )
     cooldowns = await state.get_cooldowns("rn-1")
     assert cooldowns.last_down_ts is not None
+
+
+async def test_scale_down_defers_drain_to_background_task(tmp_path: Path) -> None:
+    # ISSUE-002: the drain-grace wait must NOT run inline inside the cycle's
+    # action lock. The logical connectorDelete (stop routing) happens
+    # synchronously, but the wait + container stop/rm is deferred to a tracked
+    # background drain task so the cycle (and its lock) returns immediately.
+    loop, twingate, actuator, metrics, _state = await _make_loop(
+        tmp_path,
+        containers=[_container("c1"), _container("c2"), _container("c3")],
+        tg_connectors=[_tg("c1"), _tg("c2"), _tg("c3")],
+        collectors=[FakeCollector(CollectorSource.DOCKER_STATS, cpu=5.0)],
+    )
+    result = await loop.run_cycle()
+
+    assert result.decisions[0].direction is ScaleDirection.DOWN
+    # Routing was stopped this cycle (connectorDelete ran synchronously)...
+    assert len(twingate.deleted) == 1
+    victim = twingate.deleted[0]
+    # ...but the container stop/rm has NOT happened yet — it is deferred.
+    assert ("deprovision", victim) not in actuator.calls
+    assert victim in loop._draining
+    # The down metric increments only once the drain actually completes.
+    assert (
+        metrics.registry.get_sample_value(
+            "fc_scale_actions_total", {"rn": "rn-1", "direction": "down"}
+        )
+        is None
+    )
+
+    # Awaiting the background drain completes the stop/rm, preserving the
+    # drain-before-delete ordering (Key Design Rule #4).
+    await loop.await_pending_drains()
+    assert ("deprovision", victim) in actuator.calls
+    assert victim not in loop._draining
+    assert (
+        metrics.registry.get_sample_value(
+            "fc_scale_actions_total", {"rn": "rn-1", "direction": "down"}
+        )
+        == 1.0
+    )
+
+
+async def test_draining_connector_excluded_from_next_cycle(tmp_path: Path) -> None:
+    # While a Connector is mid-drain it must be excluded from the fleet so the
+    # next cycle neither double-deletes it nor miscounts the fleet (the running
+    # count is post-drain). A blocking sleep parks the background task at the
+    # drain wait so the victim stays mid-drain across the second cycle.
+    block = asyncio.Event()
+
+    async def blocking_sleep(_seconds: float) -> None:
+        await block.wait()
+
+    loop, twingate, _actuator, _metrics, _state = await _make_loop(
+        tmp_path,
+        containers=[_container("c1"), _container("c2"), _container("c3")],
+        tg_connectors=[_tg("c1"), _tg("c2"), _tg("c3")],
+        collectors=[FakeCollector(CollectorSource.DOCKER_STATS, cpu=5.0)],
+        # No down-cooldown, so only the draining-exclusion can prevent a second
+        # scale-down (isolates the behavior under test from the cooldown gate).
+        policy=_policy(scale_down_cooldown_seconds=0),
+        sleep=blocking_sleep,
+    )
+    await loop.run_cycle()
+    assert len(twingate.deleted) == 1
+    victim = twingate.deleted[0]
+    assert victim in loop._draining
+
+    # Second cycle while the victim is still draining: it is excluded from the
+    # fleet, so the count reads 2 (== floor) and no second delete is issued.
+    await loop.run_cycle()
+    assert twingate.deleted.count(victim) == 1
+
+    block.set()  # release the parked drain so the test tears down cleanly
+    await loop.await_pending_drains()
 
 
 async def test_no_action_within_watermarks(tmp_path: Path) -> None:
@@ -538,6 +617,7 @@ async def test_health_replace_waits_for_healthy_then_drains_old(tmp_path: Path) 
     with structlog.testing.capture_logs() as cap2:
         await loop.run_cycle()
     assert "c1" in twingate.deleted
+    await loop.await_pending_drains()  # ISSUE-002: stop/rm runs in the background
     assert ("deprovision", "c1") in actuator.calls
     assert metrics.registry.get_sample_value("fc_replacements_total", {"rn": "rn-1"}) == 1.0
     replace_event = next(e for e in cap2 if e["event"] == "action.replace")
@@ -598,6 +678,7 @@ async def test_replace_timeout_tears_down_failed_replacement_and_frees_old(tmp_p
     # connector left running (never deprovisioned-as-old by the timeout path).
     assert "health.replace_timeout" in _events(cap)
     assert "new-1" in twingate.deleted
+    await loop.await_pending_drains()  # ISSUE-002: failed replacement stop/rm is deferred
     assert ("deprovision", "new-1") in actuator.calls
     assert "c1" not in twingate.deleted
     assert ("deprovision", "c1") not in actuator.calls
@@ -822,6 +903,7 @@ async def test_cordoned_connector_not_scaled_down(tmp_path: Path) -> None:
     await state.set_cordon("c2", True, ts=NOW)
 
     await loop.run_cycle()
+    await loop.await_pending_drains()  # ISSUE-002: stop/rm runs in the background
 
     assert twingate.deleted == ["c3"]
     assert ("deprovision", "c3") in actuator.calls
@@ -881,6 +963,7 @@ async def test_manual_cordon_persists_and_applies_next_cycle(tmp_path: Path) -> 
     assert await state.list_cordoned() == {"c1", "c2"}
 
     await loop.run_cycle()
+    await loop.await_pending_drains()  # ISSUE-002: stop/rm runs in the background
     # Only c3 is eligible as the scale-down victim.
     assert ("deprovision", "c3") in actuator.calls
     assert ("deprovision", "c1") not in actuator.calls
@@ -902,6 +985,7 @@ async def test_scale_down_with_scale_step_and_cordons_holds_floor(tmp_path: Path
     await state.set_cordon("c2", True, ts=NOW)
 
     await loop.run_cycle()
+    await loop.await_pending_drains()  # ISSUE-002: stop/rm runs in the background
 
     removed = {cid for kind, cid in actuator.calls if kind == "deprovision"}
     assert removed == {"c3", "c4"}  # only the uncordoned are eligible
@@ -987,6 +1071,7 @@ async def test_manual_replace_completes_with_manual_actor_on_next_cycle(tmp_path
     with structlog.testing.capture_logs() as cap:
         await loop.run_cycle()
     assert "c1" in twingate.deleted
+    await loop.await_pending_drains()  # ISSUE-002: stop/rm runs in the background
     assert ("deprovision", "c1") in actuator.calls
     assert metrics.registry.get_sample_value("fc_replacements_total", {"rn": "rn-1"}) == 1.0
     replace_event = next(e for e in cap if e["event"] == "action.replace")
@@ -1009,6 +1094,142 @@ async def test_manual_replace_unknown_connector_refused(tmp_path: Path) -> None:
     assert twingate.created == []
     assert actuator.calls == []
     assert "ghost" not in loop._pending_replaces
+
+
+async def test_autoscale_down_suppressed_while_replace_pending(tmp_path: Path) -> None:
+    # ISSUE-001 repro: a manual replace runs the fleet at +1 (replacement up,
+    # target not yet drained). On the very next low-load cycle the autoscaler
+    # must NOT scale down — otherwise it drains the brand-new replacement and
+    # silently undoes the replace.
+    loop, twingate, actuator, _metrics, _state = await _make_loop(
+        tmp_path,
+        containers=[_container("c1"), _container("c2"), _container("c3")],
+        tg_connectors=[_tg("c1"), _tg("c2"), _tg("c3")],
+        collectors=[FakeCollector(CollectorSource.DOCKER_STATS, cpu=5.0)],  # low load
+    )
+    # Begin a replace on c1: provisions new-1, registers a pending replace.
+    await loop.manual_replace("c1")
+    assert twingate.created == ["new-1"]
+    # The replacement now appears in the fleet but is not yet ALIVE.
+    actuator._managed.append(_container("new-1"))
+    twingate._tg.append(_tg("new-1", ConnectorState.DEAD_NO_HEARTBEAT))
+
+    result = await loop.run_cycle()
+
+    # Low load over 4 connectors (floor 2) would normally scale down by one, but
+    # the in-flight replace suppresses it: nothing is drained this cycle.
+    assert result.decisions[0].direction is ScaleDirection.NONE
+    assert twingate.deleted == []
+    assert all(call[0] != "deprovision" for call in actuator.calls)
+    assert "new-1" not in twingate.deleted
+
+
+def test_pick_victims_excludes_pending_replace_pair(tmp_path: Path) -> None:
+    # Defense-in-depth: even if a scale-down were selected, the replace target
+    # and its in-flight replacement are never eligible victims.
+    loop = ControlLoop(
+        policy=_policy(),
+        twingate=FakeTwingate([]),
+        actuator=FakeActuator([]),
+        collectors=[],
+        aggregator=Aggregator(retention_seconds=3600),
+        state=StateStore(tmp_path / "s.sqlite3"),
+        metrics=Metrics(),
+        clock=lambda: NOW,
+        name_factory=lambda rn: f"{rn}-new",
+        id_factory=lambda: "cycle-1",
+        sleep=_noop_sleep,
+    )
+    from fc.loop import _PendingReplace
+
+    loop._pending_replaces["c1"] = _PendingReplace(
+        new_connector_id="new-1", started_at=NOW, reason="r", actor="auto"
+    )
+    connectors = [_container("c1"), _container("c2"), _container("new-1")]
+    victims = loop._pick_victims(connectors, 3, NOW)
+    # c1 (target) and new-1 (replacement) excluded → only c2 is a valid victim.
+    assert [v.connector_id for v in victims] == ["c2"]
+
+
+def test_pick_victims_excludes_startup_grace_connector(tmp_path: Path) -> None:
+    # A connector still inside its startup grace window (just provisioned) must
+    # not be chosen as a scale-down victim (ISSUE-001 contributing factor #2).
+    loop = ControlLoop(
+        policy=_policy(startup_grace_seconds=90),
+        twingate=FakeTwingate([]),
+        actuator=FakeActuator([]),
+        collectors=[],
+        aggregator=Aggregator(retention_seconds=3600),
+        state=StateStore(tmp_path / "s.sqlite3"),
+        metrics=Metrics(),
+        clock=lambda: NOW,
+        name_factory=lambda rn: f"{rn}-new",
+        id_factory=lambda: "cycle-1",
+        sleep=_noop_sleep,
+    )
+    # c1/c2 are well past grace; c3 was first seen seconds ago.
+    loop._first_seen = {
+        "c1": NOW - timedelta(seconds=300),
+        "c2": NOW - timedelta(seconds=300),
+        "c3": NOW - timedelta(seconds=5),
+    }
+    connectors = [_container("c1"), _container("c2"), _container("c3")]
+    victims = loop._pick_victims(connectors, 1, NOW)
+    assert "c3" not in [v.connector_id for v in victims]
+
+
+async def test_teardown_fleet_drains_all_bypassing_floor(tmp_path: Path) -> None:
+    # ISSUE-003: a deliberate full-fleet teardown drains every managed Connector
+    # — even down to zero, below the floor — because the deployment itself is
+    # being torn down (redundancy no longer applies). Drain-before-delete order
+    # is preserved and the background drains are awaited before it returns, so a
+    # subsequent `docker compose down` leaves no orphan containers or connectors.
+    loop, twingate, actuator, _metrics, state = await _make_loop(
+        tmp_path,
+        containers=[_container("c1"), _container("c2")],  # exactly at the floor (2)
+        tg_connectors=[_tg("c1"), _tg("c2")],
+        collectors=[],
+    )
+    started = await loop.teardown_fleet()
+
+    assert started == 2
+    assert set(twingate.deleted) == {"c1", "c2"}
+    assert ("deprovision", "c1") in actuator.calls
+    assert ("deprovision", "c2") in actuator.calls
+    assert loop._draining == {}  # all drains completed before returning
+    # The teardown is audited so it is distinguishable from a manual scale-down.
+    actions = await state.recent_actions(limit=5)
+    assert any(a.actor == "teardown" for a in actions)
+
+
+async def test_concurrent_manual_override_rejected_while_in_flight(tmp_path: Path) -> None:
+    # ISSUE-003: while one manual override is executing, a second concurrent one
+    # is rejected (returns False) rather than stacking behind it — bounding
+    # override spam. A normal cycle does not trigger this rejection (it uses a
+    # different lock), only a genuinely concurrent override does.
+    loop, _twingate, _actuator, _metrics, _state = await _make_loop(
+        tmp_path,
+        containers=[_container("c1"), _container("c2")],
+        tg_connectors=[_tg("c1"), _tg("c2")],
+        collectors=[],
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_provision(now: Any, log: Any, *, actor: str = "auto") -> str:
+        started.set()
+        await release.wait()
+        return "new-1"
+
+    loop._provision_one = slow_provision  # type: ignore[method-assign]
+
+    first = asyncio.create_task(loop.manual_scale("rn-1", ScaleDirection.UP))
+    await started.wait()  # the first override is now mid-flight (parked in provision)
+    second = await loop.manual_scale("rn-1", ScaleDirection.UP)
+    assert second is False  # rejected: an override is already in flight
+
+    release.set()
+    assert await first is True
 
 
 async def test_manual_replace_already_in_flight_refused(tmp_path: Path) -> None:

@@ -94,7 +94,7 @@ janus (the connector version-updater sidecar) has **no lock mechanism** — it u
 | `enabled` | `bool` | `true` | When `true`, stamp `janus.autoupdate.enable=true` and `janus.autoupdate.interval=<interval_seconds>` on every provisioned Connector (alongside the `twingate.fc.*` labels). When `false`, no janus labels are stamped. |
 | `interval_seconds` | `int >= 1` | `86400` | The auto-update interval (seconds) written into the `janus.autoupdate.interval` label. |
 
-Both fields are env-overridable via `FC_POLICY__JANUS__ENABLED` / `FC_POLICY__JANUS__INTERVAL_SECONDS`.
+Both fields are env-overridable via `FC_POLICY__JANUS__ENABLED` / `FC_POLICY__JANUS__INTERVAL_SECONDS` (env wins over the YAML). To make a `config.yaml`-vs-env disagreement unambiguous, FC logs the **effective** enrolment once at startup as `manager.janus_enrolment` (`enabled`, `interval_seconds`).
 
 ### `scale_metrics` — per-metric scale triggers
 

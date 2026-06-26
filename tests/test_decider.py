@@ -389,6 +389,57 @@ def test_scale_down_suppressed_by_cooldown() -> None:
     assert decision.metrics["cooldown_seconds_remaining"] == 1200.0
 
 
+# --- replace-in-flight suppression (ISSUE-001) -----------------------------
+
+
+def test_replace_pending_suppresses_scale_down() -> None:
+    # A replace intentionally runs the fleet at +1 (replacement up, old not yet
+    # drained — Key Design Rule #4). Low load over that transient +1 must NOT
+    # scale down, or the autoscaler drains the brand-new replacement.
+    decision = decide_scale(
+        policy=_policy(),
+        cpu_value=10.0,
+        throughput_value=100_000,  # 0.8 Mbit/s < 10 → would normally scale down
+        current_count=4,
+        cooldowns=NO_COOLDOWN,
+        now=NOW,
+        replace_pending=True,
+    )
+    assert decision.direction is ScaleDirection.NONE
+    assert "replace" in decision.reason.lower()
+
+
+def test_replace_pending_suppresses_scale_up() -> None:
+    # The replace already manages count; an extra scale-up would over-provision.
+    decision = decide_scale(
+        policy=_policy(),
+        cpu_value=90.0,
+        throughput_value=None,
+        current_count=3,
+        cooldowns=NO_COOLDOWN,
+        now=NOW,
+        replace_pending=True,
+    )
+    assert decision.direction is ScaleDirection.NONE
+    assert "replace" in decision.reason.lower()
+
+
+def test_replace_pending_still_fills_floor() -> None:
+    # Redundancy (Key Design Rule #2) outranks the replace suppression: a fleet
+    # below floor is still filled even while a replace is in flight.
+    decision = decide_scale(
+        policy=_policy(min_connectors=2),
+        cpu_value=None,
+        throughput_value=None,
+        current_count=1,
+        cooldowns=NO_COOLDOWN,
+        now=NOW,
+        replace_pending=True,
+    )
+    assert decision.direction is ScaleDirection.UP
+    assert "floor" in decision.reason.lower()
+
+
 # --- scale-up precedence over scale-down -----------------------------------
 
 

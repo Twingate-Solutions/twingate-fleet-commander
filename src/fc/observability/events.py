@@ -82,6 +82,13 @@ ACTION_REPLACE: Final = "action.replace"
 #: (``connector_id``, ``cordoned``, ``actor=manual``).
 ACTION_CORDON: Final = "action.cordon"
 
+# --- Teardown (deliberate full-fleet shutdown) -----------------------------
+#: A deliberate full-fleet teardown began — every managed Connector will be
+#: drained and removed, bypassing the floor (``rn_id``, ``count``).
+MANAGER_TEARDOWN_START: Final = "manager.teardown.start"
+#: A full-fleet teardown finished (``rn_id``, ``started`` = drains initiated).
+MANAGER_TEARDOWN_COMPLETE: Final = "manager.teardown.complete"
+
 # --- Health ----------------------------------------------------------------
 #: (debug) The health-remediation phase has begun.
 HEALTH_START: Final = "health.start"

@@ -1,7 +1,10 @@
-"""Shared parsing of the custom connector image's ``[metrics]`` stdout lines.
+"""Shared parsing of the custom connector image's ``[metrics]`` log lines.
 
-The custom connector image writes one metrics JSON line to stdout each interval,
-in the same format regardless of where it runs. Three collectors consume that
+The custom connector image writes one metrics JSON line each interval — to
+**stderr** as of the 2026-06 image update, keeping it off the stdout stream that
+carries ``ANALYTICS`` + service logs — in the same format regardless of where it
+runs. (The transport is stderr for the Docker collector and the combined
+stdout+stderr cloud log streams for CloudWatch/Azure.) Three collectors consume that
 format from different transports — the Docker log API
 (:mod:`fc.collectors.stdout_metrics`), CloudWatch Logs
 (:mod:`fc.collectors.cloudwatch_logs`), and Azure Monitor
@@ -48,7 +51,7 @@ KNOWN_FIELDS = frozenset(
 
 
 def parse_metrics_line(line: str) -> dict[str, Any] | None:
-    """Classify one stdout line and return its metrics payload, or ``None``.
+    """Classify one log line and return its metrics payload, or ``None``.
 
     A line qualifies only if it contains the ``[metrics] `` marker and the JSON
     after the marker parses and carries ``"event": "metrics"``. ``ANALYTICS``
@@ -56,7 +59,7 @@ def parse_metrics_line(line: str) -> dict[str, Any] | None:
     return ``None``.
 
     Args:
-        line: A single raw stdout line from the connector.
+        line: A single raw log line from the connector.
 
     Returns:
         The decoded metrics object, or ``None`` if the line is not a metrics

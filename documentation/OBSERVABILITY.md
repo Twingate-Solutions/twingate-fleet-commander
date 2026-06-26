@@ -79,14 +79,16 @@ The `metrics` dict on every `decide.*` line carries the triggering windowed aggr
 | `ACTION_PROVISION_START` | `action.provision.start` | info | Provisioning a Connector began | `rn_id`, `name`, `actor` |
 | `ACTION_PROVISION_SUCCESS` | `action.provision.success` | info | Connector provisioned successfully | `rn_id`, `connector_id`, `name`, `actor` |
 | `ACTION_PROVISION_FAIL` | `action.provision.fail` | error | Provisioning failed | `rn_id`, `error`, `actor` |
-| `ACTION_DEPROVISION_START` | `action.deprovision.start` | info | Drain + remove began | `rn_id`, `connector_id`, `drain_grace`, `actor` |
-| `ACTION_DEPROVISION_SUCCESS` | `action.deprovision.success` | info | Connector drained and removed | `rn_id`, `connector_id`, `actor` |
-| `ACTION_DEPROVISION_FAIL` | `action.deprovision.fail` | error | Deprovisioning failed | `rn_id`, `connector_id`, `error`, `actor` |
+| `ACTION_DEPROVISION_START` | `action.deprovision.start` | info | Drain began — `connectorDelete` (stop routing) ran; the grace wait + container stop/rm then run in a **background drain task** so the control loop is not stalled | `rn_id`, `connector_id`, `drain_grace`, `actor` |
+| `ACTION_DEPROVISION_SUCCESS` | `action.deprovision.success` | info | Connector drained and removed — emitted by the **background drain task** after the grace wait + stop/rm complete (so it lands `drain_grace_seconds` after the matching `start`) | `rn_id`, `connector_id`, `actor` |
+| `ACTION_DEPROVISION_FAIL` | `action.deprovision.fail` | error | Deprovisioning failed (Twingate delete, or the background stop/rm) | `rn_id`, `connector_id`, `error`, `actor` |
 | `ACTION_RESTART` | `action.restart` | info | Connector restarted in place | `rn_id`, `connector_id`, `restart_count`, `reason`, `state`, `sample` |
 | `ACTION_REPLACE` | `action.replace` | info | Connector replaced after repeated restart failures (logged when the wait-for-healthy replace completes) | `rn_id`, `old_connector_id`, `new_connector_id`, `old_removed`, `reason` |
 | `ACTION_CORDON` | `action.cordon` | info | Connector cordoned or un-cordoned via manual override | `connector_id`, `cordoned`, `actor=manual`, `rn_id` |
 
 The `action.restart` and `health.replace_pending` lines carry `reason` (the decider's remediation reason, e.g. `DEAD_NO_RELAYS; restart 2/3`), `state` (the Twingate state at the time, or `null`), and a bounded, secret-free `sample` object — `{cpu_pct_norm, throughput_bps, mem_bytes, source}` from the Connector's latest sample this cycle, or `null` if none — so the triggering signal travels with the action. The field set is fixed, so log cardinality stays bounded. `action.replace` carries the stored `reason` from when the replace was started.
+
+The `actor` field on provision/deprovision lines is `auto` (autoscaler), `manual` (an override endpoint), or `teardown` (the deliberate full-fleet `fc-teardown` — see *Manager lifecycle*); the same three values appear in the persisted action history.
 
 #### Health
 
@@ -101,7 +103,20 @@ The `action.restart` and `health.replace_pending` lines carry `reason` (the deci
 
 #### Janus
 
-FC emits no dedicated janus event. Janus has **no lock mechanism** (Key Design Rule #5): FC neither coordinates with it nor skips Connectors for it. Instead, FC *enrols* every Connector it provisions by stamping the janus auto-update labels (`janus.autoupdate.enable=true` + `janus.autoupdate.interval=<seconds>`) at provision time — visible on the `action.provision.success` line and on the container itself — and *absorbs* the brief upgrade-recreate via the `startup_grace_seconds` / `unhealthy_threshold_seconds` windows. See [CONFIGURATION.md](CONFIGURATION.md) → *Janus enrolment*.
+FC emits no dedicated janus *action* event. Janus has **no lock mechanism** (Key Design Rule #5): FC neither coordinates with it nor skips Connectors for it. Instead, FC *enrols* every Connector it provisions by stamping the janus auto-update labels (`janus.autoupdate.enable=true` + `janus.autoupdate.interval=<seconds>`) at provision time — visible on the `action.provision.success` line and on the container itself — and *absorbs* the brief upgrade-recreate via the `startup_grace_seconds` / `unhealthy_threshold_seconds` windows. At startup FC logs the **effective** enrolment state (`manager.janus_enrolment`, see below) so a `config.yaml`-vs-`FC_POLICY__JANUS__ENABLED` disagreement is unambiguous. See [CONFIGURATION.md](CONFIGURATION.md) → *Janus enrolment*.
+
+#### Manager lifecycle
+
+| Constant | Value | Level | Emitted when | Key fields |
+|---|---|---|---|---|
+| — | `manager.start` | info | The manager started serving | `http_port`, `poll_interval` |
+| — | `manager.janus_enrolment` | info | Logged once at startup: the effective janus enrolment after the env overlay | `enabled`, `interval_seconds` (`null` when disabled) |
+| — | `manager.overrides_enabled` | warning | Manual override endpoints are enabled (the shared secret travels in a header) | `detail` |
+| — | `manager.stop` | info | The manager is shutting down (after awaiting any in-flight background drains) | — |
+| `MANAGER_TEARDOWN_START` | `manager.teardown.start` | info | A deliberate full-fleet teardown began (`fc-teardown`) — every managed Connector will be drained and removed, **bypassing the floor** | `rn_id`, `count` |
+| `MANAGER_TEARDOWN_COMPLETE` | `manager.teardown.complete` | info | The full-fleet teardown finished and all background drains were awaited | `rn_id`, `started` |
+
+The `fc-teardown` entrypoint is the clean way to stop a deployment: it drains every Connector (`connectorDelete` → grace → stop/rm, audited with `actor=teardown`) **before** `docker compose down`, so no Connector container or logical Connector is left orphaned. A routine manager restart does **not** trigger teardown — only this explicit command does.
 
 #### Config and external-dependency errors
 

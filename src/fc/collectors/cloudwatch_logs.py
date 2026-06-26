@@ -1,9 +1,9 @@
 """Cloud collector: parse the custom image's ``[metrics]`` lines from CloudWatch.
 
 On ECS there is no Docker socket to tail and the Prometheus collector is gone,
-so FC reads the **same** ``[metrics]`` stdout lines the custom connector image
-emits — but from CloudWatch Logs, where the task's ``awslogs`` driver delivers
-them. The line classification and sample construction are shared with the
+so FC reads the **same** ``[metrics]`` lines the custom connector image emits
+(now on stderr) — but from CloudWatch Logs, where the task's ``awslogs`` driver
+delivers both stdout and stderr. The line classification and sample construction are shared with the
 Docker-log collector via :mod:`fc.collectors.metrics_payload`; this module only
 adds the CloudWatch transport and degrades gracefully when logs are unavailable.
 

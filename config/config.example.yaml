@@ -13,10 +13,11 @@
 poll_interval_seconds: 30
 
 # Image FC provisions for every connector it runs. THE DEFAULT is the custom
-# image, which emits rich per-connector tunnel metrics on stdout (consumed by the
-# stdout_metrics collector below):
+# image, which emits rich per-connector tunnel metrics on stderr (consumed by the
+# stdout_metrics collector below; the image keeps ANALYTICS + service logs on
+# stdout so metrics can't corrupt them):
 connector_image: "ghcr.io/twingate-solutions/twingate-custom-connector-container:latest"
-# BACKUP: the official image works too, but emits no stdout metrics — set
+# BACKUP: the official image works too, but emits no metrics lines — set
 # stdout_metrics:false and rely on docker_stats (CPU + NIC-delta throughput):
 #   connector_image: "twingate/connector:1"
 
@@ -25,7 +26,7 @@ collectors:
   # (true tunnel throughput); docker_stats stays on as the universal fallback.
   # With the official image as a backup, set stdout_metrics:false.
   docker_stats: true        # universal CPU + NIC-delta throughput fallback (any image)
-  stdout_metrics: true      # primary tunnel throughput from the custom image's stdout
+  stdout_metrics: true      # primary tunnel throughput from the custom image's stderr metrics
 
 labels:                     # Docker labels FC sets/reads to identify managed connectors
   managed: "twingate.fc.managed"

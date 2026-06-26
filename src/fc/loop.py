@@ -32,6 +32,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 from uuid import uuid4
 
 import structlog
@@ -163,6 +164,12 @@ class ControlLoop:
         # together under one ``asyncio.gather``). Held across a whole cycle and
         # across each manual override; readiness/metrics endpoints don't take it.
         self._action_lock = asyncio.Lock()
+        # Bounds manual-override spam (ISSUE-003): a manual override held here is
+        # in flight, so a concurrent override is rejected rather than stacked.
+        # Distinct from ``_action_lock`` (which also serializes the cycle), so a
+        # normal cycle never causes an override to be rejected — only another
+        # in-flight override does.
+        self._override_lock = asyncio.Lock()
         # Connector id → the time FC first observed it this run. Drives the
         # decider's startup grace window so a just-provisioned Connector is not
         # restarted before its first heartbeat. In-memory by design: after a
@@ -181,8 +188,64 @@ class ControlLoop:
         # replaces, which self-heals as the still-unhealthy old Connector is
         # re-evaluated next cycle).
         self._pending_replaces: dict[str, _PendingReplace] = {}
+        # Connector id → its in-flight background drain task. A scale-down or
+        # replace stops routing (``connectorDelete``) synchronously, then defers
+        # the drain-grace wait + container stop/rm to a background task so the
+        # action lock is not held across the wait (ISSUE-002). A Connector here
+        # is mid-drain: excluded from counts, victim selection, and health until
+        # its task completes. Awaited on shutdown so no drain is abandoned.
+        self._draining: dict[str, asyncio.Task[bool]] = {}
 
     # -- public entry points -------------------------------------------------
+
+    async def await_pending_drains(self) -> None:
+        """Block until every in-flight background drain task has finished.
+
+        Drains started by a scale-down or a completed replace run as background
+        tasks (ISSUE-002); this awaits all of them so a graceful shutdown — or a
+        test — can be certain no drain is still in flight (each has completed its
+        grace wait and container stop/rm). Safe to call when none are pending.
+        """
+        if not self._draining:
+            return
+        await asyncio.gather(*list(self._draining.values()), return_exceptions=True)
+
+    async def teardown_fleet(self) -> int:
+        """Drain and remove the ENTIRE managed fleet, bypassing the floor.
+
+        A deliberate, operator-initiated shutdown of the whole Remote Network
+        (ISSUE-003). Unlike scale-down — which refuses to breach
+        ``min_connectors`` — this takes the fleet to zero, because the
+        deployment itself is being torn down and redundancy no longer applies.
+        Each Connector is drained via the normal connectorDelete → grace →
+        stop/rm path (Key Design Rule #4), and the background drains are awaited
+        before returning, so a following ``docker compose down`` leaves no orphan
+        containers on the host and no orphan logical Connectors in the tenant.
+
+        This is **not** wired to the normal SIGTERM path — a routine manager
+        restart (config reload, janus upgrade, crash) must leave the data plane
+        running. It is invoked only by the explicit ``fc-teardown`` entrypoint.
+
+        Returns the number of Connectors for which a drain was started.
+        """
+        now = self._clock()
+        rn_id = self._policy.remote_network_id
+        log = logger.bind(actor="teardown", rn_id=rn_id)
+        async with self._action_lock:
+            fleet = await self._discover(log)
+            connectors = [
+                c for c in fleet if c.rn_id == rn_id and c.connector_id not in self._draining
+            ]
+            log.info(events.MANAGER_TEARDOWN_START, count=len(connectors))
+            started = 0
+            for connector in connectors:
+                if await self._deprovision_one(connector, now, log, actor="teardown"):
+                    started += 1
+        # Await outside the action lock: each background drain re-acquires it for
+        # its container stop/rm, so holding it here would deadlock.
+        await self.await_pending_drains()
+        log.info(events.MANAGER_TEARDOWN_COMPLETE, started=started)
+        return started
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:
         """Run cycles on the poll interval until ``stop_event`` is set.
@@ -239,7 +302,13 @@ class ControlLoop:
                 # from empty (the "start only the manager and it self-provisions"
                 # path).
                 rn_id = self._policy.remote_network_id
-                connectors = [c for c in fleet if c.rn_id == rn_id]
+                # Exclude Connectors mid-drain (ISSUE-002): their routing is
+                # already stopped and their container stop/rm is running in the
+                # background, so the running count is post-drain and they are
+                # never re-selected or re-remediated this cycle.
+                connectors = [
+                    c for c in fleet if c.rn_id == rn_id and c.connector_id not in self._draining
+                ]
                 result.rn_count = 1
                 # Isolate a failure deciding/acting on the Remote Network (e.g. a
                 # sqlite hiccup reading cooldowns) so the heartbeat, gauges, and
@@ -462,6 +531,7 @@ class ControlLoop:
             now=now,
             cpu_by_connector=cpu_by,
             throughput_by_connector_bps=tput_by,
+            replace_pending=bool(self._pending_replaces),
         )
         self._log_decision(decision, log)
         log.debug(events.DECIDE_COMPLETE, direction=decision.direction.value)
@@ -583,7 +653,7 @@ class ControlLoop:
             if provisioned:
                 await self._state.set_cooldown(rn_id, ScaleDirection.UP, now)
         elif decision.direction is ScaleDirection.DOWN:
-            victims = self._pick_victims(connectors, decision.count)
+            victims = self._pick_victims(connectors, decision.count, now)
             removed = 0
             for victim in victims:
                 if await self._deprovision_one(victim, now, log):
@@ -591,20 +661,52 @@ class ControlLoop:
             if removed:
                 await self._state.set_cooldown(rn_id, ScaleDirection.DOWN, now)
 
-    @staticmethod
-    def _pick_victims(connectors: list[ManagedConnector], count: int) -> list[ManagedConnector]:
-        """Pick up to ``count`` scale-down victims, never a cordoned one.
+    def _pick_victims(
+        self, connectors: list[ManagedConnector], count: int, now: datetime
+    ) -> list[ManagedConnector]:
+        """Pick up to ``count`` scale-down victims, never an ineligible one.
 
-        Cordoned Connectors are excluded. Those with a known logical connector id
-        are preferred (so the logical Connector can be deleted to stop routing).
-        The model carries no creation time and the Docker list order is not a
-        reliable age signal, so within the id-known group the (stable) discovery
-        order is used only as an arbitrary-but-deterministic tiebreak — not as a
-        "newest"/"oldest" guarantee.
+        Excluded from victim selection (ISSUE-001 defense-in-depth):
+
+        * **cordoned** Connectors (a manual operator hand-off);
+        * the **target and the in-flight replacement** of any pending replace —
+          draining either undoes a cycle-spanning replace (Key Design Rule #4);
+        * Connectors still inside their **startup grace window** (just
+          provisioned — give them time to heartbeat before they can be drained).
+
+        Those with a known logical connector id are preferred (so the logical
+        Connector can be deleted to stop routing). The model carries no creation
+        time and the Docker list order is not a reliable age signal, so within
+        the id-known group the (stable) discovery order is used only as an
+        arbitrary-but-deterministic tiebreak — not a "newest"/"oldest" guarantee.
         """
-        eligible = [c for c in connectors if not c.cordoned]
+        protected: set[str] = set()
+        for old_id, pending in self._pending_replaces.items():
+            protected.add(old_id)
+            protected.add(pending.new_connector_id)
+        grace = self._policy.startup_grace_seconds
+        eligible = [
+            c
+            for c in connectors
+            if not c.cordoned
+            and c.connector_id not in protected
+            and not self._within_startup_grace(c.connector_id, now, grace)
+        ]
         eligible.sort(key=lambda c: c.connector_id == "")
         return eligible[:count]
+
+    def _within_startup_grace(self, connector_id: str, now: datetime, grace_seconds: int) -> bool:
+        """Return whether a Connector is still inside its startup grace window.
+
+        A grace of ``0`` (or a Connector with no recorded first-seen time) is
+        never "within grace", so the gate is a no-op unless configured.
+        """
+        if grace_seconds <= 0:
+            return False
+        first_seen = self._first_seen.get(connector_id)
+        if first_seen is None:
+            return False
+        return (now - first_seen).total_seconds() < grace_seconds
 
     async def _provision_one(
         self,
@@ -669,30 +771,44 @@ class ControlLoop:
         *,
         actor: str = "auto",
     ) -> bool:
-        """Drain then remove one Connector; return whether it succeeded.
+        """Stop routing to one Connector now; finish the drain in the background.
 
-        Order (Key Design Rule #4): ``connectorDelete`` (controller stops
-        routing) → wait ``drain_grace_seconds`` → ``actuator.deprovision``
-        (stop + remove). A failure is logged as ``action.deprovision.fail`` and
-        recorded. ``actor`` is ``"manual"`` when driven by an override endpoint.
+        Phase 1 (synchronous, here): ``connectorDelete`` tells the controller to
+        stop routing new connections to the Connector. This is the commitment
+        point the return value reflects.
+
+        Phase 2 (background, :meth:`_finish_drain`): wait ``drain_grace_seconds``
+        for in-flight connections to drain, then ``actuator.deprovision`` (stop +
+        remove). Run as a tracked background task so the control-loop action lock
+        is **not** held across the grace wait (ISSUE-002) — otherwise the whole
+        fleet's collection/health and the status snapshot stall for the drain
+        window. The Connector is recorded in ``_draining`` until phase 2
+        completes, so it is excluded from counts, victim selection, and health.
+
+        ``actor`` is ``"manual"`` when driven by an override endpoint. Returns
+        whether the drain was *started* (``connectorDelete`` succeeded, or the
+        victim had no logical id to delete); the caller uses that to set the
+        scale-down cooldown / complete a replace. Drain-before-delete ordering
+        (Key Design Rule #4) is preserved within phase 2.
         """
         rn_id = self._policy.remote_network_id
+        cid = victim.connector_id
         log.info(
             events.ACTION_DEPROVISION_START,
             rn_id=rn_id,
-            connector_id=victim.connector_id,
+            connector_id=cid,
             drain_grace=self._policy.drain_grace_seconds,
             actor=actor,
         )
         try:
-            if victim.connector_id:
-                await self._twingate.delete_connector(victim.connector_id)
+            if cid:
+                await self._twingate.delete_connector(cid)
         except TwingateApiError as exc:
             self._metrics.twingate_api_errors.inc()
             log.error(
                 events.ACTION_DEPROVISION_FAIL,
                 rn_id=rn_id,
-                connector_id=victim.connector_id,
+                connector_id=cid,
                 error=str(exc),
                 actor=actor,
             )
@@ -703,58 +819,115 @@ class ControlLoop:
                 "twingate error",
                 "fail",
                 now,
-                connector_id=victim.connector_id,
+                connector_id=cid,
                 actor=actor,
             )
             return False
 
-        await self._sleep(self._policy.drain_grace_seconds)
+        # Routing is stopped; defer the grace wait + container stop/rm off the
+        # action lock as a tracked background task.
+        key = cid or (victim.container_id or "")
+        task: asyncio.Task[bool] = asyncio.create_task(
+            self._finish_drain(victim, now, log, actor=actor),
+            name=f"drain-{key}",
+        )
+        if key:
+            self._draining[key] = task
+        return True
 
+    async def _finish_drain(
+        self,
+        victim: ManagedConnector,
+        now: datetime,
+        log: structlog.BoundLogger,
+        *,
+        actor: str = "auto",
+    ) -> bool:
+        """Background phase of a deprovision: drain-grace wait, then stop/remove.
+
+        The grace wait runs **without** the action lock so the control loop is
+        never stalled (ISSUE-002); only the brief container stop/rm and its
+        bookkeeping re-acquire the lock to stay serialized with the cycle and the
+        manual overrides. The ``_draining`` entry is always cleared on exit so a
+        failed stop/rm can't wedge the Connector out of future cycles. Returns
+        whether the container was actually removed.
+        """
+        rn_id = self._policy.remote_network_id
+        cid = victim.connector_id
+        key = cid or (victim.container_id or "")
         try:
-            await self._actuator.deprovision(victim)
-        except ActuatorError as exc:
-            self._metrics.docker_api_errors.inc()
+            await self._sleep(self._policy.drain_grace_seconds)
+            async with self._action_lock:
+                try:
+                    await self._actuator.deprovision(victim)
+                except ActuatorError as exc:
+                    self._metrics.docker_api_errors.inc()
+                    log.error(
+                        events.ACTION_DEPROVISION_FAIL,
+                        rn_id=rn_id,
+                        connector_id=cid,
+                        error=str(exc),
+                        actor=actor,
+                    )
+                    await self._record(
+                        rn_id,
+                        "deprovision",
+                        1,
+                        "docker error",
+                        "fail",
+                        now,
+                        connector_id=cid,
+                        actor=actor,
+                    )
+                    return False
+
+                log.info(
+                    events.ACTION_DEPROVISION_SUCCESS,
+                    rn_id=rn_id,
+                    connector_id=cid,
+                    actor=actor,
+                )
+                self._metrics.scale_actions.labels(rn=rn_id, direction="down").inc()
+                match actor:
+                    case "auto":
+                        reason = "scale down"
+                    case "teardown":
+                        reason = "fleet teardown"
+                    case _:
+                        reason = "manual scale down"
+                await self._record(
+                    rn_id,
+                    "deprovision",
+                    1,
+                    reason,
+                    "success",
+                    now,
+                    connector_id=cid,
+                    actor=actor,
+                )
+                # Drop any cordon row for the removed Connector so a stale cordon
+                # can't outlive it (and re-cordon a future Connector reusing the id).
+                if cid:
+                    await self._state.set_cordon(cid, False, ts=now)
+                return True
+        except Exception as exc:
+            # This runs detached as a background task; an escaping exception would
+            # surface only as an unretrieved-task warning. Log it and continue —
+            # the ``finally`` still releases the ``_draining`` slot so the
+            # Connector returns to normal evaluation next cycle (resilient by
+            # design, like the rest of the loop).
             log.error(
                 events.ACTION_DEPROVISION_FAIL,
                 rn_id=rn_id,
-                connector_id=victim.connector_id,
-                error=str(exc),
-                actor=actor,
-            )
-            await self._record(
-                rn_id,
-                "deprovision",
-                1,
-                "docker error",
-                "fail",
-                now,
-                connector_id=victim.connector_id,
+                connector_id=cid,
+                error=type(exc).__name__,
+                detail=str(exc),
                 actor=actor,
             )
             return False
-
-        log.info(
-            events.ACTION_DEPROVISION_SUCCESS,
-            rn_id=rn_id,
-            connector_id=victim.connector_id,
-            actor=actor,
-        )
-        self._metrics.scale_actions.labels(rn=rn_id, direction="down").inc()
-        await self._record(
-            rn_id,
-            "deprovision",
-            1,
-            "scale down" if actor == "auto" else "manual scale down",
-            "success",
-            now,
-            connector_id=victim.connector_id,
-            actor=actor,
-        )
-        # Drop any cordon row for the removed Connector so a stale cordon can't
-        # outlive it (and re-cordon a future Connector that reuses the id).
-        if victim.connector_id:
-            await self._state.set_cordon(victim.connector_id, False, ts=now)
-        return True
+        finally:
+            if key:
+                self._draining.pop(key, None)
 
     async def _act_health(
         self,
@@ -1016,6 +1189,13 @@ class ControlLoop:
         actor: str = "auto",
     ) -> None:
         """Append an action to the history log (best-effort; never raises)."""
+        resolved_actor: Literal["auto", "manual", "teardown"]
+        if actor == "manual":
+            resolved_actor = "manual"
+        elif actor == "teardown":
+            resolved_actor = "teardown"
+        else:
+            resolved_actor = "auto"
         record = ActionRecord(
             ts=now,
             rn_id=rn_id,
@@ -1023,7 +1203,7 @@ class ControlLoop:
             count=count,
             reason=reason,
             outcome="success" if outcome == "success" else "fail",
-            actor="manual" if actor == "manual" else "auto",
+            actor=resolved_actor,
         )
         await self._state.record_action(record, connector_id=connector_id)
 
@@ -1089,9 +1269,14 @@ class ControlLoop:
         """
         now = self._clock()
         log = logger.bind(actor="manual", rn_id=rn_id)
-        async with self._action_lock:
+        if self._override_lock.locked():
+            log.info(events.DECIDE_NO_ACTION, reason="override already in flight; rejected")
+            return False
+        async with self._override_lock, self._action_lock:
             fleet = await self._discover(log)
-            connectors = [c for c in fleet if c.rn_id == rn_id]
+            connectors = [
+                c for c in fleet if c.rn_id == rn_id and c.connector_id not in self._draining
+            ]
             count = len(connectors)
 
             if direction is ScaleDirection.UP:
@@ -1107,7 +1292,7 @@ class ControlLoop:
                 if count <= self._policy.min_connectors:
                     log.info(events.DECIDE_NO_ACTION, reason="manual scale-down at floor")
                     return False
-                victims = self._pick_victims(connectors, 1)
+                victims = self._pick_victims(connectors, 1, now)
                 if not victims:
                     return False
                 removed = await self._deprovision_one(victims[0], now, log, actor="manual")
@@ -1141,7 +1326,10 @@ class ControlLoop:
         """
         now = self._clock()
         log = logger.bind(actor="manual", connector_id=connector_id)
-        async with self._action_lock:
+        if self._override_lock.locked():
+            log.info(events.ACTION_CORDON, reason="override already in flight; rejected")
+            return False
+        async with self._override_lock, self._action_lock:
             fleet = await self._discover(log)
             match = next((c for c in fleet if c.connector_id == connector_id), None)
             if cordoned and match is None:
@@ -1187,7 +1375,10 @@ class ControlLoop:
         """
         now = self._clock()
         log = logger.bind(actor="manual", connector_id=connector_id)
-        async with self._action_lock:
+        if self._override_lock.locked():
+            log.info(events.ACTION_REPLACE, reason="override already in flight; rejected")
+            return False
+        async with self._override_lock, self._action_lock:
             fleet = await self._discover(log)
             match = next((c for c in fleet if c.connector_id == connector_id), None)
             if match is None:

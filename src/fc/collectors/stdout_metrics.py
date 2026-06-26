@@ -1,11 +1,18 @@
-"""Opt-in collector: parse the custom image's stdout metrics JSON lines.
+"""Opt-in collector: parse the custom image's ``[metrics]`` JSON lines.
 
-The custom connector image writes a metrics JSON line to stdout every 60s,
-sharing the stream with ordinary service logs and (when
-``TWINGATE_LOG_ANALYTICS=v2``) ``ANALYTICS`` traffic lines. This collector tails
-the container's logs over the Docker API — an independent read that does not
-interfere with the log-shipper — classifies each line, and maps the most recent
-metrics payload onto a normalized :class:`~fc.models.ResourceSample`.
+The custom connector image writes a metrics JSON line every 60s. **As of the
+2026-06 image update it writes metrics to stderr** — ``ANALYTICS`` traffic lines
+and ordinary service logs stay on stdout — deliberately separating the two
+writers so a metrics line can never interleave into, and corrupt, a large
+analytics line (the bug that previously broke the log-shipper's parsing). This
+collector therefore tails the container's **stderr** over the Docker API — an
+independent read that does not interfere with the log-shipper — classifies each
+line, and maps the most recent metrics payload onto a normalized
+:class:`~fc.models.ResourceSample`.
+
+The collector keeps its historical ``stdout_metrics`` name and
+``CollectorSource.STDOUT_METRICS`` source (config key + metric labels) for
+stability, even though the underlying stream is now stderr.
 
 It is opt-in and custom-image only: on the official image no metrics lines
 appear and :meth:`StdoutMetricsCollector.collect` returns ``None``.
@@ -112,7 +119,11 @@ class StdoutMetricsCollector:
 
         try:
             container = await self._docker.containers.get(connector.container_id)
-            raw_log = await container.log(stdout=True, stderr=False, tail=_LOG_TAIL)
+            # Metrics are on the container's STDERR (the image moved them there so
+            # they can't interleave with stdout ANALYTICS lines). Read stderr only:
+            # a clean, low-volume stream where the once-a-minute metrics line is
+            # never crowded out of the tail by high-volume analytics traffic.
+            raw_log = await container.log(stdout=False, stderr=True, tail=_LOG_TAIL)
         except Exception as exc:
             raise CollectorError(f"docker log read failed: {type(exc).__name__}") from exc
 

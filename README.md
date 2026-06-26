@@ -67,6 +67,24 @@ floor itself.
 For other topologies (minimal, hardened socket-proxy, Docker Desktop, cloud VM), see the
 thin variants in [`deploy/compose/`](deploy/compose/).
 
+### Tearing down (clean — no orphans)
+
+FC `docker run`s the Connector containers directly (they are **not** compose-managed), so a
+plain `docker compose down` would stop only `fc`/`janus` and leave every Connector container
+running with its logical Connector still registered in the tenant. Tear the fleet down
+**first**, then stop the stack:
+
+```bash
+docker compose exec fc fc-teardown      # drain + remove every managed Connector, then exit
+docker compose --profile shipping down -v
+```
+
+`fc-teardown` drains and removes every Connector FC manages (`connectorDelete` → drain grace →
+stop/rm), **bypassing the `min_connectors` floor** because the whole deployment is going away.
+It is a deliberate, explicit command — a routine manager restart (config reload, janus
+upgrade, crash) never tears down the data plane, so Connectors keep serving across FC
+restarts. A normal `docker compose restart fc` is always safe.
+
 ### First-boot on a cloud VM
 
 Thin cloud-init / user-data snippets that fetch and run `bootstrap.sh` live in
@@ -278,6 +296,13 @@ require a shared secret (`FC_OVERRIDE_SECRET`, ≥16 chars) sent in the
   target — so the fleet never dips below the floor mid-replace.
 - Every override is actuated through the same floor/ceiling- and drain-respecting paths as
   the autoscaler and is written to the action history with `actor=manual`.
+- **Debounced:** while one override is in flight, a concurrent override is rejected rather
+  than queued, so rapid clicking can't stack unbounded provisions/drains. A drain's grace
+  wait no longer blocks the control loop or the status UI — the connector's removal runs as a
+  background task, so the fleet view updates immediately and the rest of the fleet keeps being
+  monitored during a drain.
+- An in-flight replace **suspends autoscaling** for the Remote Network until it finishes, so
+  the autoscaler can't drain the brand-new replacement while the replace is still settling.
 
 > ⚠️ **Floor-fill:** manually removing or replacing a Connector below `min_connectors`
 > only triggers FC to **auto-fill the Remote Network back up to the floor on the next

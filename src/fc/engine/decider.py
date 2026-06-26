@@ -65,6 +65,7 @@ def decide_scale(
     now: datetime,
     cpu_by_connector: dict[str, float] | None = None,
     throughput_by_connector_bps: dict[str, float] | None = None,
+    replace_pending: bool = False,
 ) -> ScaleDecision:
     """Decide whether to scale the Remote Network up, down, or not at all.
 
@@ -86,6 +87,12 @@ def decide_scale(
         throughput_by_connector_bps: Per-connector windowed throughput
             (connector id → bytes/sec), for the ``any``/``quorum`` modes.
             ``None`` is treated as empty.
+        replace_pending: Whether a wait-for-healthy replace is in flight for the
+            Remote Network (Key Design Rule #4). When ``True``, autoscale up/down
+            is suppressed for this cycle — the replace already manages count, and
+            its intentional transient +1 (replacement up, old not yet drained)
+            must not be read as over-provisioned. Floor-fill is exempt
+            (redundancy outranks the suppression).
 
     Returns:
         Exactly one :class:`ScaleDecision`. A :attr:`ScaleDirection.NONE`
@@ -131,6 +138,21 @@ def decide_scale(
                 f"below floor (current={current_count}, min={policy.min_connectors}) — "
                 f"provisioning {fill} to restore redundancy"
             ),
+            metrics=metrics,
+        )
+
+    # ISSUE-001: while a wait-for-healthy replace is in flight for this RN, the
+    # fleet intentionally runs at +1 (replacement up, old Connector not yet
+    # drained — Key Design Rule #4). The replace already manages count, so
+    # suppress autoscale up/down this cycle; otherwise the transient +1 reads as
+    # over-provisioned under low load and scale-down drains the brand-new
+    # replacement. Floor-fill above is exempt — redundancy outranks this.
+    if replace_pending:
+        return ScaleDecision(
+            rn_id=policy.remote_network_id,
+            direction=ScaleDirection.NONE,
+            count=0,
+            reason="autoscale suppressed: a replace is in flight for this Remote Network",
             metrics=metrics,
         )
 

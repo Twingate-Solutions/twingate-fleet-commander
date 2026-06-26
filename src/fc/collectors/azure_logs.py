@@ -1,9 +1,9 @@
 """Cloud collector: parse the custom image's ``[metrics]`` lines from Azure Monitor.
 
 The ACI mirror of the CloudWatch collector. On ACI there is no Docker socket, so
-FC reads the **same** ``[metrics]`` stdout lines the custom connector image emits
-from the container group's logs, surfaced in a Log Analytics workspace
-(``ContainerInstanceLog_CL``). The line classification and sample construction
+FC reads the **same** ``[metrics]`` lines the custom connector image emits (now
+on stderr — the container group's logs capture both stdout and stderr), surfaced
+in a Log Analytics workspace (``ContainerInstanceLog_CL``). The line classification and sample construction
 are shared with the other collectors via :mod:`fc.collectors.metrics_payload`;
 this module only adds the Log Analytics query transport and degrades gracefully
 when the workspace or table is unavailable.

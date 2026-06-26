@@ -74,7 +74,7 @@ Isolation: a failure in the decide/act block is caught, logged as `loop.rn.error
 
 `ControlLoop._act_scale` and `ControlLoop._act_health` (`src/fc/loop.py`)
 
-Executes the decisions produced in Phase 3. Scale actions use the three-step provision and drain-before-delete sequences described below. Health actions use the restart-before-replace sequence. All actuation is serialized under `_action_lock` (an `asyncio.Lock`), which also serializes manual override requests arriving from the FastAPI layer.
+Executes the decisions produced in Phase 3. Scale actions use the three-step provision and drain-before-delete sequences described below. Health actions use the restart-before-replace sequence. Actuation is serialized under `_action_lock` (an `asyncio.Lock`), which also serializes manual override requests arriving from the FastAPI layer. The one part that runs **outside** the lock is a deprovision's drain-grace wait: `connectorDelete` (stop routing) happens synchronously under the lock, then the wait + container stop/rm is handed to a tracked **background drain task** so a 120s drain can't stall the cycle, the rest of the fleet's monitoring, or the status snapshot. Connectors mid-drain are held in `_draining` and excluded from the fleet count, victim selection, and health until their task finishes; `await_pending_drains()` lets shutdown await them so none is abandoned. A separate `_override_lock` rejects a *concurrent* manual override (debounce) without blocking on a normal cycle.
 
 ---
 
@@ -83,8 +83,8 @@ Executes the decisions produced in Phase 3. Scale actions use the three-step pro
 These rules are enforced at the enforcement points listed. Violating them is not a recoverable error; they are invariants the code never relaxes.
 
 **Rule 1 — The Twingate API does not deploy compute.**
-Provisioning is always three ordered steps: `connectorCreate` → `connectorGenerateTokens` → `docker run` with those tokens. Deprovisioning is the reverse: `connectorDelete` → `drain_grace_seconds` wait → stop/remove container. Tokens are unique per Connector and are never reused across containers or stored anywhere except the new container's environment.
-*Enforced in:* `ControlLoop._provision_one` and `_deprovision_one` (`src/fc/loop.py`).
+Provisioning is always three ordered steps: `connectorCreate` → `connectorGenerateTokens` → `docker run` with those tokens. Deprovisioning is the reverse: `connectorDelete` → `drain_grace_seconds` wait → stop/remove container (the wait + stop/rm run in a background task — see Rule 4). Tokens are unique per Connector and are never reused across containers or stored anywhere except the new container's environment.
+*Enforced in:* `ControlLoop._provision_one`, `_deprovision_one`, and `_finish_drain` (`src/fc/loop.py`).
 
 **Rule 2 — Hard floor.**
 `scale_down_count` in `src/fc/engine/policy.py` returns `0` when `current <= min_connectors`, and `min_connectors` has a Pydantic `ge=2` constraint on the flat `Policy` model. The floor cannot be set below 2 (in YAML or via an `FC_POLICY__*` env override). A Remote Network found below its floor is filled back up before anything else, independent of load and ungated by the up-cooldown.
@@ -95,8 +95,8 @@ Each scale metric (CPU, throughput) is reduced over its *own* trailing window wi
 *Enforced in:* `src/fc/engine/decider.py:decide_scale`, `src/fc/engine/aggregator.py`, `src/fc/engine/policy.py:cooldown_remaining`.
 
 **Rule 4 — Drain before delete.**
-Scale-down order: pick victim → `connectorDelete` (the controller stops routing new connections) → wait `drain_grace_seconds` → `actuator.deprovision` (stop + remove container). Health replace is **cycle-spanning and wait-for-healthy**: provision the replacement first (`_begin_replace`) and register a pending replace; only on a *later* cycle, once the replacement reports `ALIVE`/healthy, is the old Connector drained and deleted (`_process_pending_replaces`). Capacity never dips. If the replacement does not become healthy within `replace_health_timeout_seconds`, FC emits an alertable `health.replace_timeout`, tears down the failed (never-healthy) replacement, and leaves the old traffic-serving Connector in place to retry next cycle (fail-forward). A Connector is acted on for health only after it has been continuously unhealthy past `unhealthy_threshold_seconds`. Token reuse for a *sequential* same-logical-connector replacement is permitted; two concurrent active containers sharing one token is forbidden (Rule 1).
-*Enforced in:* `ControlLoop._deprovision_one`, `_begin_replace`, and `_process_pending_replaces` (`src/fc/loop.py`).
+Scale-down order: pick victim → `connectorDelete` (the controller stops routing new connections) → wait `drain_grace_seconds` → `actuator.deprovision` (stop + remove container). The `connectorDelete` runs synchronously; the wait + stop/rm run in a tracked **background drain task** (`_finish_drain`) so the grace wait never holds `_action_lock` — a Connector mid-drain is held in `_draining` and excluded from the count, victim selection, and health until removed. Health replace is **cycle-spanning and wait-for-healthy**: provision the replacement first (`_begin_replace`) and register a pending replace; only on a *later* cycle, once the replacement reports `ALIVE`/healthy, is the old Connector drained and deleted (`_process_pending_replaces`). Capacity never dips. **While a replace is pending, autoscaling for the RN is suppressed** (and the replacement, the replace target, and any connector still inside `startup_grace_seconds` are never scale-down victims) so the autoscaler can't drain the in-flight replacement. If the replacement does not become healthy within `replace_health_timeout_seconds`, FC emits an alertable `health.replace_timeout`, tears down the failed (never-healthy) replacement, and leaves the old traffic-serving Connector in place to retry next cycle (fail-forward). A Connector is acted on for health only after it has been continuously unhealthy past `unhealthy_threshold_seconds`. Token reuse for a *sequential* same-logical-connector replacement is permitted; two concurrent active containers sharing one token is forbidden (Rule 1).
+*Enforced in:* `ControlLoop._deprovision_one` / `_finish_drain` / `_pick_victims`, `decide_scale(replace_pending=…)`, `_begin_replace`, and `_process_pending_replaces` (`src/fc/loop.py`, `src/fc/engine/decider.py`).
 
 **Rule 5 — Tolerate janus.**
 janus has **no lock mechanism** — it upgrades a Connector container whenever a newer image is published. FC does not coordinate with janus via a lock or marker. Instead it (a) *enrols* every Connector it provisions by stamping janus's auto-update labels (`janus.autoupdate.enable=true` + `janus.autoupdate.interval=<seconds>`, gated by the `janus:` policy block), and (b) *absorbs* the brief container recreate a janus upgrade causes (same token, new image) via the `startup_grace_seconds` and `unhealthy_threshold_seconds` windows rather than remediating during that window.
@@ -139,15 +139,23 @@ A failure at step 1 or 2 logs `action.provision.fail`, increments `fc_twingate_a
 ### Deprovision (scale-down or replace's old-side)
 
 ```
-1. twingate.delete_connector(connector_id)
-        → controller stops routing new connections to this Connector
-2. sleep(drain_grace_seconds)
-        → existing connections drain
-3. actuator.deprovision(connector)
-        → container stop + remove
+_deprovision_one (synchronous, under _action_lock):
+  1. twingate.delete_connector(connector_id)
+          → controller stops routing new connections to this Connector
+  2. mark connector_id in _draining; schedule _finish_drain as a background task
+
+_finish_drain (background task, lock released during the wait):
+  3. sleep(drain_grace_seconds)
+          → existing connections drain
+  4. async with _action_lock: actuator.deprovision(connector)
+          → container stop + remove; clear the _draining slot
 ```
 
-A failure at step 1 aborts the sequence (the container stays running; a future cycle may retry). A failure at step 3 after a successful step 1 leaves an orphaned container that no longer receives connections; it will be picked up again on the next cycle.
+A failure at step 1 aborts the sequence (the container stays running; a future cycle may retry). The split means the cycle returns immediately after step 1–2 rather than blocking for `drain_grace_seconds`; the Connector is excluded from the fleet (count, victims, health) while in `_draining` so it is not double-acted. A failure at step 4 after a successful step 1 leaves an orphaned container that no longer receives connections; it will be picked up again on the next cycle. On shutdown, `await_pending_drains()` waits for outstanding `_finish_drain` tasks so a drain is never abandoned mid-flight.
+
+### Full-fleet teardown (deliberate)
+
+`ControlLoop.teardown_fleet()` (exposed as the `fc-teardown` console entrypoint) drains and removes **every** managed Connector via the same deprovision path, **bypassing the `min_connectors` floor** because the whole deployment is being torn down, then awaits all background drains before returning. It is invoked only by the explicit command — never by the normal SIGTERM path — so a routine manager restart leaves the data plane running. Teardown drains are audited with `actor=teardown`.
 
 ### Health remediation — restart before replace (cycle-spanning)
 

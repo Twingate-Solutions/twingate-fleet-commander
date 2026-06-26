@@ -126,7 +126,8 @@ class ActionRecord(BaseModel):
     """A persisted record of an action FC took, for history and cooldowns.
 
     Stored in SQLite so decisions and cooldown timers survive a manager
-    restart. ``actor`` distinguishes autoscaler actions from manual overrides.
+    restart. ``actor`` distinguishes autoscaler actions (``auto``) from manual
+    overrides (``manual``) and a deliberate full-fleet teardown (``teardown``).
     """
 
     ts: datetime
@@ -135,4 +136,4 @@ class ActionRecord(BaseModel):
     count: int
     reason: str
     outcome: Literal["success", "fail"]
-    actor: Literal["auto", "manual"] = "auto"
+    actor: Literal["auto", "manual", "teardown"] = "auto"

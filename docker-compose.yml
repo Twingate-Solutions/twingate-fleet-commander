@@ -119,6 +119,10 @@ services:
       TWINGATE_SHIPPER_S3_REGION: "${TWINGATE_SHIPPER_S3_REGION:-}"
       TWINGATE_SHIPPER_S3_PREFIX: "${TWINGATE_SHIPPER_S3_PREFIX:-}"
       TWINGATE_SHIPPER_DOCKER_CONTAINER_NAME_FILTER: "${TWINGATE_SHIPPER_DOCKER_CONTAINER_NAME_FILTER:-twingate-custom-connector-container}"
+      # One shipper per host watches ALL matching connector containers (dynamic
+      # discovery), not just one. By default it also ships the connector's stderr
+      # (the custom image's `[metrics]` lines); set false for analytics-only.
+      TWINGATE_SHIPPER_INCLUDE_STDERR: "${TWINGATE_SHIPPER_INCLUDE_STDERR:-true}"
     volumes:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
 

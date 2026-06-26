@@ -133,10 +133,23 @@ async def _amain() -> None:
                 "over loopback, never plain HTTP on a public interface"
             ),
         )
+    # Surface the EFFECTIVE janus enrolment (after the FC_POLICY__ env overlay),
+    # so a config.yaml-vs-env disagreement can't leave the operator guessing
+    # whether provisioned Connectors get janus's auto-update labels (Rule #5).
+    logger.info(
+        "manager.janus_enrolment",
+        enabled=policy.janus.enabled,
+        interval_seconds=policy.janus.interval_seconds if policy.janus.enabled else None,
+    )
     logger.info("manager.start", http_port=_HTTP_PORT, poll_interval=policy.poll_interval_seconds)
     try:
         await asyncio.gather(loop.run_forever(stop_event), server.serve())
     finally:
+        # Let any in-flight background drain finish its container stop/rm rather
+        # than abandoning it mid-drain (which would orphan a container whose
+        # logical Connector was already deleted — ISSUE-003). This does NOT tear
+        # down healthy Connectors; a routine restart leaves the data plane up.
+        await loop.await_pending_drains()
         await platform.aclose()
         await http.aclose()
         logger.info("manager.stop")
@@ -161,9 +174,50 @@ def _install_signal_handlers(stop_event: asyncio.Event, server: uvicorn.Server) 
             loop.add_signal_handler(sig, _request_stop)
 
 
+async def _ateardown() -> None:
+    """Async body of the deliberate full-fleet teardown (``fc-teardown``).
+
+    Builds the minimal dependency set (no HTTP server), drains and removes every
+    managed Connector via :meth:`ControlLoop.teardown_fleet` — bypassing the
+    floor because the deployment is being torn down — then closes resources. Run
+    this **before** ``docker compose down`` so no Connector container or logical
+    Connector is left orphaned (ISSUE-003).
+    """
+    settings = Settings()  # type: ignore[call-arg]  # fields come from env
+    configure_logging(settings.fc_log_level)
+    policy = load_policy(settings.fc_config_path)
+
+    state = StateStore(settings.fc_state_path)
+    await state.init()
+
+    http = httpx.AsyncClient()
+    twingate = TwingateClient(settings.twingate_network, settings.twingate_api_key, client=http)
+    platform = build_platform(settings, policy, http=http)
+    loop = ControlLoop(
+        policy=policy,
+        twingate=twingate,
+        actuator=platform.actuator,
+        collectors=platform.collectors,
+        aggregator=Aggregator(retention_seconds=_retention_seconds(policy)),
+        state=state,
+        metrics=Metrics(),
+    )
+    logger.info("manager.teardown.invoke")
+    try:
+        await loop.teardown_fleet()
+    finally:
+        await platform.aclose()
+        await http.aclose()
+
+
 def run() -> None:
     """Console-script entrypoint (``fc``)."""
     asyncio.run(_amain())
+
+
+def teardown() -> None:
+    """Console-script entrypoint (``fc-teardown``): drain the whole fleet, then exit."""
+    asyncio.run(_ateardown())
 
 
 if __name__ == "__main__":

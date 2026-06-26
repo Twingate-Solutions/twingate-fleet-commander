@@ -54,8 +54,10 @@ class _FakeContainer:
         self._inspect = inspect
 
     async def log(self, *, stdout: bool = False, stderr: bool = False, **kwargs: Any) -> list[str]:
-        assert stdout is True
-        assert stderr is False
+        # Metrics now come from stderr (the image moved them off stdout so they
+        # can't corrupt large stdout ANALYTICS lines).
+        assert stdout is False
+        assert stderr is True
         return self._lines
 
     async def show(self, **kwargs: Any) -> dict[str, Any]:
