@@ -1,0 +1,85 @@
+name: Publish image
+
+# Builds the Fleet Commander image for linux/amd64 + linux/arm64 and pushes it to
+# GHCR. Semver tags (v1.2.3) publish the full set of version tags plus :latest;
+# pushes to main publish a rolling :edge image for testing.
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+# One in-flight publish per ref; a newer commit/tag supersedes an older build.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/twingate-solutions/fleet-commander
+
+jobs:
+  build-and-push:
+    name: Build & push (amd64, arm64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write       # push to GHCR
+      attestations: write   # build provenance attestation
+      id-token: write       # OIDC token for the attestation signer
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # QEMU emulates arm64 on the amd64 runner so a single job builds both arches.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Derives tags + OCI labels from the ref. On a v* tag this emits the semver
+      # ladder (1.2.3, 1.2, 1) and :latest; on main it emits :edge.
+      - name: Derive tags & labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=edge,branch=main
+          labels: |
+            org.opencontainers.image.title=Fleet Commander
+            org.opencontainers.image.description=Single-host control plane that autoscales a fleet of Twingate Connectors.
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build & push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Reuse layers across runs via the GitHub Actions cache backend.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      # Signs an attestation linking the pushed digest to this workflow run.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
