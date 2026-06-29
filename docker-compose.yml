@@ -42,6 +42,13 @@ services:
     container_name: fc
     restart: unless-stopped
     env_file: .env
+    # The image runs as non-root (USER fc, uid 10001); the host docker.sock is
+    # mode 660 root:docker, so fc must join the host's docker group to reach it.
+    # DOCKER_GID is the host's `docker` group GID (`getent group docker`); the
+    # :-988 default covers the common Ubuntu value. Without this the actuator
+    # gets permission denied on every Docker call.
+    group_add:
+      - "${DOCKER_GID:-988}"
     volumes:
       # Root-equivalent: required so the actuator can run/stop/rm Connector containers.
       # Swap for `tcp://socket-proxy:2375` (see below) to harden.
@@ -91,6 +98,10 @@ services:
     image: ghcr.io/twingate-solutions/janus-updater-service:latest
     container_name: fc-janus
     restart: unless-stopped
+    # Same socket-permission requirement as fc (see the fc service above): join
+    # the host docker group so a non-root janus can drive the daemon.
+    group_add:
+      - "${DOCKER_GID:-988}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 
