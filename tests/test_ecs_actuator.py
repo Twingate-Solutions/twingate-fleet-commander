@@ -180,6 +180,35 @@ async def test_provision_registers_sizing_and_runs_with_tokens_and_tags() -> Non
     assert net["assignPublicIp"] == "DISABLED"
 
 
+async def test_provision_stamps_default_nofile_ulimit_on_task_def() -> None:
+    ecs = _FakeEcs()
+    actuator = _actuator(ecs)
+
+    await actuator.provision(rn_id="rn-1", connector_id="cid-1", name="fc-abc123", tokens=_tokens())
+
+    register = next(kw for op, kw in ecs.calls if op == "register")
+    ulimits = register["containerDefinitions"][0]["ulimits"]
+    assert ulimits == [{"name": "nofile", "softLimit": 131072, "hardLimit": 131072}]
+
+
+async def test_provision_honors_configured_nofile_on_task_def() -> None:
+    ecs = _FakeEcs()
+    actuator = EcsActuator(
+        _FakeSession(ecs),
+        settings=_settings(),
+        network="acme",
+        image="ghcr.io/twingate-solutions/twingate-custom-connector-container:latest",
+        labels=LABELS,
+        nofile=262144,
+    )
+
+    await actuator.provision(rn_id="rn-1", connector_id="cid-1", name="fc-abc123", tokens=_tokens())
+
+    register = next(kw for op, kw in ecs.calls if op == "register")
+    ulimits = register["containerDefinitions"][0]["ulimits"]
+    assert ulimits == [{"name": "nofile", "softLimit": 262144, "hardLimit": 262144}]
+
+
 async def test_provision_reuses_one_task_definition() -> None:
     ecs = _FakeEcs()
     actuator = _actuator(ecs)

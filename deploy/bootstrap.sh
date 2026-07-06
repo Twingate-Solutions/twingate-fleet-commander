@@ -23,6 +23,11 @@
 #   TWINGATE_API_KEY   Admin/DevOps API key (FC uses it to create/delete connectors)
 #   FC_HEALTH_URL      base URL to poll (default http://localhost:8080)
 #   FC_WAIT_TIMEOUT    seconds to wait for health (default 180)
+#   FC_TUNE_HOST       set to 1 to also apply host-global kernel/Docker tuning
+#                      (deploy/tune-host.sh) for a large, busy host. Off by
+#                      default so small/dev hosts are untouched. FC already stamps
+#                      the per-connector limits (nofile, ports, log rotation)
+#                      itself, so this is only for the host-global sysctls.
 
 set -euo pipefail
 
@@ -178,9 +183,22 @@ wait_healthy() {
   log "manager is healthy — status UI at ${HEALTH_URL}/ (loopback by default)"
 }
 
+# ── Optional host tuning ──────────────────────────────────────────────────────
+tune_host() {
+  if [ "${FC_TUNE_HOST:-0}" != "1" ]; then
+    return 0
+  fi
+  local script="${SCRIPT_DIR}/tune-host.sh"
+  [ -x "$script" ] || [ -f "$script" ] || { warn "FC_TUNE_HOST=1 but ${script} not found — skipping"; return 0; }
+  log "FC_TUNE_HOST=1 — applying host-global kernel/Docker tuning"
+  # Runs before the stack comes up so a daemon restart (if enabled) precedes it.
+  bash "$script" || warn "host tuning reported an error — continuing"
+}
+
 main() {
   log "Fleet Commander — host bootstrap"
   install_docker
+  tune_host
   ensure_files
   collect_secrets
   compose_up

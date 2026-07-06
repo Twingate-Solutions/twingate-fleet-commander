@@ -169,6 +169,58 @@ async def test_provision_always_applies_prescribed_resource_limits() -> None:
     assert host_config["Memory"] == 2_147_483_648  # 2 GiB
 
 
+async def test_provision_stamps_default_nofile_ulimit() -> None:
+    docker = _FakeDocker()
+    actuator = _actuator(docker)
+
+    await actuator.provision(rn_id="rn-1", connector_id="cid", name="c1", tokens=_tokens())
+
+    ulimits = docker.containers.run_calls[0]["HostConfig"]["Ulimits"]
+    assert ulimits == [{"Name": "nofile", "Soft": 131072, "Hard": 131072}]
+
+
+async def test_provision_honors_configured_nofile() -> None:
+    docker = _FakeDocker()
+    actuator = _actuator(docker, nofile=262144)
+
+    await actuator.provision(rn_id="rn-1", connector_id="cid", name="c1", tokens=_tokens())
+
+    ulimits = docker.containers.run_calls[0]["HostConfig"]["Ulimits"]
+    assert ulimits == [{"Name": "nofile", "Soft": 262144, "Hard": 262144}]
+
+
+async def test_provision_stamps_default_port_range_and_log_rotation() -> None:
+    docker = _FakeDocker()
+    actuator = _actuator(docker)
+
+    await actuator.provision(rn_id="rn-1", connector_id="cid", name="c1", tokens=_tokens())
+
+    host_config = docker.containers.run_calls[0]["HostConfig"]
+    assert host_config["Sysctls"]["net.ipv4.ip_local_port_range"] == "10240 65535"
+    # ping_group_range is still stamped alongside the port range.
+    assert host_config["Sysctls"]["net.ipv4.ping_group_range"] == "0 2147483647"
+    assert host_config["LogConfig"] == {
+        "Type": "json-file",
+        "Config": {"max-size": "20m", "max-file": "5"},
+    }
+
+
+async def test_provision_honors_configured_port_range_and_log_rotation() -> None:
+    docker = _FakeDocker()
+    actuator = _actuator(
+        docker,
+        ephemeral_port_range="1024 65535",
+        log_max_size="50m",
+        log_max_file=3,
+    )
+
+    await actuator.provision(rn_id="rn-1", connector_id="cid", name="c1", tokens=_tokens())
+
+    host_config = docker.containers.run_calls[0]["HostConfig"]
+    assert host_config["Sysctls"]["net.ipv4.ip_local_port_range"] == "1024 65535"
+    assert host_config["LogConfig"]["Config"] == {"max-size": "50m", "max-file": "3"}
+
+
 async def test_provision_stamps_janus_labels_when_enabled() -> None:
     # janus enabled (the default): every provisioned connector carries the
     # auto-update enrolment labels so the janus sidecar adopts it.

@@ -49,6 +49,21 @@ _CONNECTOR_CPU_LIMIT_CORES = 1
 _CONNECTOR_NANO_CPUS = _CONNECTOR_CPU_LIMIT_CORES * 1_000_000_000  # Docker NanoCpus
 _CONNECTOR_MEM_LIMIT_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 
+# Default per-connector open-file-descriptor limit (see ``Policy.connector_nofile``).
+# ~8 FDs per client tunnel, so this caps concurrent connections per Connector; set
+# explicitly rather than inherited from the host daemon so the ceiling is
+# deterministic and visible in config.
+_DEFAULT_CONNECTOR_NOFILE = 131072
+
+# Default per-connector tuning stamped on every provisioned container (see the
+# matching ``Policy.connector_*`` knobs). The ephemeral port range widens the
+# outbound source-port pool (~55k ports) so a busy connector does not exhaust it;
+# log rotation caps the always-on ANALYTICS stream so connector log files cannot
+# fill the host disk.
+_DEFAULT_EPHEMERAL_PORT_RANGE = "10240 65535"
+_DEFAULT_LOG_MAX_SIZE = "20m"
+_DEFAULT_LOG_MAX_FILE = 5
+
 
 class DockerActuatorError(ActuatorError):
     """Raised when a Docker lifecycle operation fails.
@@ -122,6 +137,10 @@ class DockerActuator:
         labels: Labels,
         janus_enabled: bool = True,
         janus_interval_seconds: int = 86400,
+        nofile: int = _DEFAULT_CONNECTOR_NOFILE,
+        ephemeral_port_range: str = _DEFAULT_EPHEMERAL_PORT_RANGE,
+        log_max_size: str = _DEFAULT_LOG_MAX_SIZE,
+        log_max_file: int = _DEFAULT_LOG_MAX_FILE,
         inspect_cache: InspectCache | None = None,
     ) -> None:
         """Build the actuator.
@@ -133,6 +152,17 @@ class DockerActuator:
             image: Connector image reference used when provisioning.
             labels: The FC Docker label keys (managed/remote-network/
                 connector-id).
+            nofile: Per-connector open-file-descriptor limit stamped as the
+                container ``nofile`` ulimit (soft = hard). ~8 FDs per client
+                tunnel, so this bounds concurrent connections per Connector.
+            ephemeral_port_range: Value for the container
+                ``net.ipv4.ip_local_port_range`` sysctl (``"<low> <high>"``),
+                widening the outbound source-port pool so a busy connector does
+                not exhaust it.
+            log_max_size: ``json-file`` ``max-size`` per log file (e.g. ``20m``).
+            log_max_file: ``json-file`` ``max-file`` count. Together with
+                ``log_max_size`` these cap the always-on ANALYTICS log stream so
+                connector logs cannot fill the host disk.
             janus_enabled: When ``True``, :meth:`provision` stamps the janus
                 auto-update enrolment labels (``janus.autoupdate.enable=true`` +
                 ``janus.autoupdate.interval``) so the janus sidecar adopts the
@@ -152,6 +182,10 @@ class DockerActuator:
         self._labels = labels
         self._janus_enabled = janus_enabled
         self._janus_interval_seconds = janus_interval_seconds
+        self._nofile = nofile
+        self._ephemeral_port_range = ephemeral_port_range
+        self._log_max_size = log_max_size
+        self._log_max_file = log_max_file
         self._inspect = inspect_cache or InspectCache(docker)
 
     async def provision(
@@ -166,7 +200,10 @@ class DockerActuator:
         Always stamps Twingate's prescribed per-connector resource limits
         (1 vCPU / 2 GB — Key Design Rule N2) via the Docker ``NanoCpus`` and
         ``Memory`` host-config fields, so the CPU watermark is a percentage of a
-        known 1-core envelope.
+        known 1-core envelope, plus the connection-capacity tuning that FC's
+        scale triggers cannot see: the ``nofile`` ulimit, the
+        ``net.ipv4.ip_local_port_range`` sysctl, and ``json-file`` log rotation
+        (so the always-on ANALYTICS stream cannot fill the host disk).
 
         Args:
             rn_id: Remote Network id (stamped as the remote-network label).
@@ -184,9 +221,28 @@ class DockerActuator:
         """
         host_config: dict[str, Any] = {
             "RestartPolicy": {"Name": "unless-stopped"},
-            "Sysctls": {"net.ipv4.ping_group_range": _PING_GROUP_RANGE},
+            "Sysctls": {
+                "net.ipv4.ping_group_range": _PING_GROUP_RANGE,
+                # Widen the outbound source-port pool so a busy connector does not
+                # exhaust ephemeral ports (a connection ceiling FC can't see).
+                "net.ipv4.ip_local_port_range": self._ephemeral_port_range,
+            },
             "NanoCpus": _CONNECTOR_NANO_CPUS,
             "Memory": _CONNECTOR_MEM_LIMIT_BYTES,
+            # Explicit open-file-descriptor limit so the per-connector connection
+            # ceiling (~8 FDs/tunnel) is deterministic and not inherited from the
+            # host daemon default. Soft = hard so the connector can use it all.
+            "Ulimits": [{"Name": "nofile", "Soft": self._nofile, "Hard": self._nofile}],
+            # Cap the always-on ANALYTICS log stream so connector log files cannot
+            # grow unbounded and fill the host disk. Pinning json-file also keeps
+            # the file-reading log-shipper working regardless of the daemon default.
+            "LogConfig": {
+                "Type": "json-file",
+                "Config": {
+                    "max-size": self._log_max_size,
+                    "max-file": str(self._log_max_file),
+                },
+            },
         }
 
         container_labels = {

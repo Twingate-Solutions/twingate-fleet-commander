@@ -104,6 +104,10 @@ def _build_docker(settings: Settings, policy: Policy) -> Platform:
         labels=policy.labels,
         janus_enabled=policy.janus.enabled,
         janus_interval_seconds=policy.janus.interval_seconds,
+        nofile=policy.connector_nofile,
+        ephemeral_port_range=policy.connector_ephemeral_port_range,
+        log_max_size=policy.connector_log_max_size,
+        log_max_file=policy.connector_log_max_file,
         inspect_cache=inspect_cache,
     )
     collectors: list[Collector] = []
@@ -140,6 +144,7 @@ def _build_ecs(
         network=settings.twingate_network,
         image=policy.connector_image,
         labels=policy.labels,
+        nofile=policy.connector_nofile,
     )
     collectors: list[Collector] = []
     if policy.collectors.stdout_metrics:
@@ -191,7 +196,12 @@ def _build_aci(
     http: httpx.AsyncClient,
     token_provider_factory: AciTokenProviderFactory | None,
 ) -> Platform:
-    """Azure ACI backend: REST actuator + Azure-Monitor collector."""
+    """Azure ACI backend: REST actuator + Azure-Monitor collector.
+
+    Note: ``policy.connector_nofile`` is **not** applied here — Azure Container
+    Instances exposes no ulimit control, so the container group inherits the ACI
+    platform default file-descriptor limit.
+    """
     aci_settings: AciSettings = load_aci_settings()
     if token_provider_factory is not None:
         token_provider = token_provider_factory(aci_settings)

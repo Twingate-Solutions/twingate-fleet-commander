@@ -59,6 +59,11 @@ _STOP_WAIT_ATTEMPTS = 60  # ~120s ceiling at the default 2s interval
 _TASK_CPU_UNITS = 1024
 _TASK_MEM_MIB = 2048
 
+# Default per-connector open-file-descriptor limit (see ``Policy.connector_nofile``).
+# ~8 FDs per client tunnel, so this bounds concurrent connections per task; set on
+# the container definition rather than inherited from the platform default.
+_DEFAULT_CONNECTOR_NOFILE = 131072
+
 
 class EcsActuatorError(ActuatorError):
     """Raised when an ECS lifecycle operation fails (no token ever in message)."""
@@ -103,6 +108,7 @@ class EcsActuator:
         network: str,
         image: str,
         labels: Labels,
+        nofile: int = _DEFAULT_CONNECTOR_NOFILE,
         stop_poll_interval_seconds: float = _STOP_POLL_INTERVAL_SECONDS,
         stop_wait_attempts: int = _STOP_WAIT_ATTEMPTS,
     ) -> None:
@@ -116,6 +122,8 @@ class EcsActuator:
             image: Connector image reference for the task definition.
             labels: The FC identity keys, reused verbatim as ECS tag keys so the
                 fleet is rediscovered the same way it is on Docker.
+            nofile: Per-connector open-file-descriptor limit stamped as the
+                container ``nofile`` ulimit (soft = hard) in the task definition.
             stop_poll_interval_seconds: Seconds between ``DescribeTasks`` polls
                 while waiting for a stopped task to reach STOPPED on restart.
             stop_wait_attempts: Maximum number of those polls before a restart
@@ -126,6 +134,7 @@ class EcsActuator:
         self._network = network
         self._image = image
         self._labels = labels
+        self._nofile = nofile
         self._stop_poll_interval_seconds = stop_poll_interval_seconds
         self._stop_wait_attempts = stop_wait_attempts
         # Name tag key derived from the managed label's namespace so the cloud
@@ -173,9 +182,10 @@ class EcsActuator:
         """Register (once) and return the connector task-definition reference.
 
         The task definition carries the image, the prescribed 1 vCPU / 2 GB
-        sizing, the awslogs configuration (when a log group is set), and a single
-        non-secret ``TWINGATE_NETWORK`` env. Tokens are supplied per-run as a
-        container override, so one revision is reused for every connector.
+        sizing, the ``nofile`` ulimit, the awslogs configuration (when a log group
+        is set), and a single non-secret ``TWINGATE_NETWORK`` env. Tokens are
+        supplied per-run as a container override, so one revision is reused for
+        every connector.
         """
         if self._task_def_arn is not None:
             return self._task_def_arn
@@ -191,6 +201,10 @@ class EcsActuator:
                 # static, so it lives in the reused task definition.
                 {"name": "TWINGATE_LOG_ANALYTICS", "value": "v2"},
             ],
+            # Explicit open-file-descriptor limit (~8 FDs/tunnel) so the connection
+            # ceiling per task is deterministic, not inherited from the platform
+            # default. Soft = hard so the connector can use it all.
+            "ulimits": [{"name": "nofile", "softLimit": self._nofile, "hardLimit": self._nofile}],
         }
         if self._settings.log_group:
             container_def["logConfiguration"] = {

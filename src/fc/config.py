@@ -318,6 +318,32 @@ class Policy(BaseSettings):
     # -- process / fleet-wide settings --------------------------------------
     poll_interval_seconds: int = Field(ge=1)
     connector_image: str
+    # Per-connector open-file-descriptor limit (``nofile``), stamped by the
+    # actuator on every Connector it provisions (Docker ``Ulimits`` / ECS
+    # ``ulimits``). Each client tunnel consumes ~8 FDs, so this is effectively the
+    # ceiling on concurrent connections a single Connector can carry — a limit FC's
+    # CPU/throughput scale triggers cannot see, so it is set explicitly rather than
+    # inherited from the host daemon default. The default (131072) allows ~16k
+    # tunnels per Connector and stays under the usual ``fs.nr_open`` (1048576) so
+    # no host sysctl change is required to honor it. Not enforceable on the ACI
+    # backend (Azure Container Instances exposes no ulimit control).
+    connector_nofile: int = Field(default=131072, ge=1024, le=1048576)
+    # Per-connector ephemeral (source) port range for outbound connections,
+    # stamped by the Docker actuator as the ``net.ipv4.ip_local_port_range``
+    # sysctl. A connector opening many outbound flows exhausts the default range
+    # (~28k ports) and new connections fail — another ceiling FC's CPU/throughput
+    # triggers cannot see. Value is ``"<low> <high>"`` (space-separated, as the
+    # kernel expects); the default widens the range to ~55k ports. Applies to the
+    # Docker backend only (ECS/ACI use platform defaults).
+    connector_ephemeral_port_range: str = "10240 65535"
+    # Per-connector log rotation, stamped by the Docker actuator as the
+    # ``json-file`` log driver with these caps. Connectors emit continuous
+    # ANALYTICS lines (analytics is always on), so without a cap their log files
+    # grow unbounded and can fill the host disk. Pinning ``json-file`` also keeps
+    # the file-reading log-shipper working regardless of the daemon default
+    # driver. Docker backend only (ECS uses awslogs/CloudWatch; ACI uses Azure).
+    connector_log_max_size: str = "20m"
+    connector_log_max_file: int = Field(default=5, ge=1)
     collectors: CollectorToggles
     labels: Labels
     janus: JanusConfig = Field(default_factory=JanusConfig)
@@ -330,7 +356,32 @@ class Policy(BaseSettings):
                 f"max_connectors ({self.max_connectors}) must be >= "
                 f"min_connectors ({self.min_connectors})"
             )
+        self._validate_port_range()
+        self._validate_log_max_size()
         return self
+
+    def _validate_port_range(self) -> None:
+        """Validate ``connector_ephemeral_port_range`` is ``"<low> <high>"``."""
+        parts = self.connector_ephemeral_port_range.split()
+        if len(parts) != 2 or not all(p.isdigit() for p in parts):
+            raise ValueError(
+                "connector_ephemeral_port_range must be two integers "
+                f'"<low> <high>", got {self.connector_ephemeral_port_range!r}'
+            )
+        low, high = int(parts[0]), int(parts[1])
+        if not (1024 <= low < high <= 65535):
+            raise ValueError(
+                "connector_ephemeral_port_range must satisfy "
+                f"1024 <= low < high <= 65535, got {low} {high}"
+            )
+
+    def _validate_log_max_size(self) -> None:
+        """Validate ``connector_log_max_size`` is a Docker size like ``20m``."""
+        if not re.fullmatch(r"\d+[bkmg]?", self.connector_log_max_size, re.IGNORECASE):
+            raise ValueError(
+                "connector_log_max_size must be a Docker size (e.g. '20m', '1g'), "
+                f"got {self.connector_log_max_size!r}"
+            )
 
     @classmethod
     def settings_customise_sources(

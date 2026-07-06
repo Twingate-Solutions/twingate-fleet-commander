@@ -132,6 +132,75 @@ def test_no_env_uses_yaml_then_default(tmp_path: Path) -> None:
     assert policy.startup_grace_seconds == 90  # field default (absent from YAML)
 
 
+def test_connector_nofile_defaults(tmp_path: Path) -> None:
+    """connector_nofile defaults to 131072 when absent from YAML."""
+    policy = load_policy(_write(tmp_path, GOOD_YAML))
+    assert policy.connector_nofile == 131072
+
+
+def test_connector_nofile_from_yaml(tmp_path: Path) -> None:
+    """connector_nofile is read from YAML when present."""
+    policy = load_policy(_write(tmp_path, GOOD_YAML + "connector_nofile: 262144\n"))
+    assert policy.connector_nofile == 262144
+
+
+def test_connector_nofile_below_min_rejected(tmp_path: Path) -> None:
+    """connector_nofile below the 1024 floor is rejected."""
+    with pytest.raises(ConfigError):
+        load_policy(_write(tmp_path, GOOD_YAML + "connector_nofile: 512\n"))
+
+
+def test_connector_nofile_above_max_rejected(tmp_path: Path) -> None:
+    """connector_nofile above 1048576 (the usual fs.nr_open) is rejected."""
+    with pytest.raises(ConfigError):
+        load_policy(_write(tmp_path, GOOD_YAML + "connector_nofile: 2097152\n"))
+
+
+def test_connector_tuning_defaults(tmp_path: Path) -> None:
+    """Port range and log rotation default when absent from YAML."""
+    policy = load_policy(_write(tmp_path, GOOD_YAML))
+    assert policy.connector_ephemeral_port_range == "10240 65535"
+    assert policy.connector_log_max_size == "20m"
+    assert policy.connector_log_max_file == 5
+
+
+def test_connector_tuning_from_yaml(tmp_path: Path) -> None:
+    """Port range and log rotation are read from YAML when present."""
+    yaml = GOOD_YAML + (
+        'connector_ephemeral_port_range: "20000 60000"\n'
+        'connector_log_max_size: "50m"\n'
+        "connector_log_max_file: 3\n"
+    )
+    policy = load_policy(_write(tmp_path, yaml))
+    assert policy.connector_ephemeral_port_range == "20000 60000"
+    assert policy.connector_log_max_size == "50m"
+    assert policy.connector_log_max_file == 3
+
+
+def test_port_range_malformed_rejected(tmp_path: Path) -> None:
+    """A port range that is not two integers is rejected."""
+    with pytest.raises(ConfigError):
+        load_policy(_write(tmp_path, GOOD_YAML + 'connector_ephemeral_port_range: "hi"\n'))
+
+
+def test_port_range_low_not_below_high_rejected(tmp_path: Path) -> None:
+    """A port range with low >= high is rejected."""
+    with pytest.raises(ConfigError):
+        load_policy(_write(tmp_path, GOOD_YAML + 'connector_ephemeral_port_range: "60000 20000"\n'))
+
+
+def test_port_range_out_of_bounds_rejected(tmp_path: Path) -> None:
+    """A port range exceeding 65535 is rejected."""
+    with pytest.raises(ConfigError):
+        load_policy(_write(tmp_path, GOOD_YAML + 'connector_ephemeral_port_range: "1024 70000"\n'))
+
+
+def test_log_max_size_malformed_rejected(tmp_path: Path) -> None:
+    """A log size that is not a Docker size string is rejected."""
+    with pytest.raises(ConfigError):
+        load_policy(_write(tmp_path, GOOD_YAML + 'connector_log_max_size: "big"\n'))
+
+
 def test_scale_up_trigger_defaults(tmp_path: Path) -> None:
     """The sticky-connector knobs default to quorum / 0.5 when absent from YAML."""
     policy = load_policy(_write(tmp_path, GOOD_YAML))

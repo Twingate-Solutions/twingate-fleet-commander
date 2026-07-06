@@ -131,7 +131,9 @@ FC actuates one compute backend, chosen explicitly by `FC_PLATFORM` (`docker` de
 | `ecs` | AWS ECS (`RunTask`, 1:1) | one task per Connector | CloudWatch Logs | `pip install -e '.[ecs]'` |
 | `aci` | Azure Container Instances | one container group per Connector | Log Analytics | `pip install -e '.[aci]'` |
 
-Every backend applies the prescribed **1 vCPU / 2 GB** sizing (Rule N2) and upholds the single-use-token rule (a token is never active on two containers/tasks/groups at once; cloud "restart" relaunches the **same** token sequentially). Per-platform setup — API mapping, least-privilege IAM/Azure roles, settings, and collection — is in [`docs/platforms/ecs.md`](docs/platforms/ecs.md) and [`docs/platforms/aci.md`](docs/platforms/aci.md).
+Every backend applies the prescribed **1 vCPU / 2 GB** sizing (Rule N2) and upholds the single-use-token rule (a token is never active on two containers/tasks/groups at once; cloud "restart" relaunches the **same** token sequentially). Per-platform setup — API mapping, least-privilege IAM/Azure roles, settings, and collection — is in [`documentation/platforms/ecs.md`](documentation/platforms/ecs.md) and [`documentation/platforms/aci.md`](documentation/platforms/aci.md).
+
+On AWS the `docker` backend also runs well on **one large EC2 instance** packed with Connector containers — often the cheapest path to saturating a single network pipe. Instance sizing, host tuning, and the network-ceiling monitoring FC can't see itself are covered in [`documentation/platforms/ec2.md`](documentation/platforms/ec2.md).
 
 ---
 

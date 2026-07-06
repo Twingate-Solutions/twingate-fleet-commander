@@ -21,6 +21,27 @@ connector_image: "ghcr.io/twingate-solutions/twingate-custom-connector-container
 # stdout_metrics:false and rely on docker_stats (CPU + NIC-delta throughput):
 #   connector_image: "twingate/connector:1"
 
+# Per-connector open-file-descriptor limit (`nofile`), stamped by the actuator on
+# every Connector it provisions (Docker Ulimits / ECS ulimits). ~8 FDs per client
+# tunnel, so this is effectively the ceiling on concurrent connections one Connector
+# can carry — a limit FC's CPU/throughput triggers cannot see, so it is set here
+# rather than left to the host daemon default. Default 131072 (~16k tunnels) stays
+# under the usual fs.nr_open (1048576). Not enforceable on the ACI backend.
+# connector_nofile: 131072
+
+# Per-connector ephemeral (source) port range for outbound connections, stamped as
+# the container net.ipv4.ip_local_port_range sysctl. A busy connector can exhaust
+# the default ~28k-port range and fail new connections — another ceiling FC's scale
+# triggers can't see. Format is "<low> <high>". Docker backend only.
+# connector_ephemeral_port_range: "10240 65535"
+
+# Per-connector log rotation, stamped as the json-file driver max-size/max-file.
+# Connectors emit continuous ANALYTICS lines (analytics is always on), so without a
+# cap their log files grow unbounded and can fill the host disk. Docker backend only
+# (ECS uses awslogs/CloudWatch; ACI uses Azure Monitor).
+# connector_log_max_size: "20m"
+# connector_log_max_file: 5
+
 collectors:
   # With the custom image (the default), stdout_metrics is the primary signal
   # (true tunnel throughput); docker_stats stays on as the universal fallback.
