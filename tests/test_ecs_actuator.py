@@ -180,6 +180,20 @@ async def test_provision_registers_sizing_and_runs_with_tokens_and_tags() -> Non
     assert net["assignPublicIp"] == "DISABLED"
 
 
+async def test_provision_enables_init_process_on_task_def() -> None:
+    # ECS equivalent of Docker's --init: without it, processes a container script
+    # orphans are reparented to the non-reaping connector at PID 1 and pile up as
+    # zombies. initProcessEnabled is supported on Fargate as well as EC2.
+    ecs = _FakeEcs()
+    actuator = _actuator(ecs)
+
+    await actuator.provision(rn_id="rn-1", connector_id="cid-1", name="fc-abc123", tokens=_tokens())
+
+    register = next(kw for op, kw in ecs.calls if op == "register")
+    linux_params = register["containerDefinitions"][0]["linuxParameters"]
+    assert linux_params == {"initProcessEnabled": True}
+
+
 async def test_provision_stamps_default_nofile_ulimit_on_task_def() -> None:
     ecs = _FakeEcs()
     actuator = _actuator(ecs)

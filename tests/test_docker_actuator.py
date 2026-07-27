@@ -169,6 +169,18 @@ async def test_provision_always_applies_prescribed_resource_limits() -> None:
     assert host_config["Memory"] == 2_147_483_648  # 2 GiB
 
 
+async def test_provision_enables_init_process() -> None:
+    # Connector images exec the connector binary as PID 1, and it never reaps
+    # children it did not spawn. Without an init process, anything a container
+    # script orphans is reparented to PID 1 and becomes a permanent zombie.
+    docker = _FakeDocker()
+    actuator = _actuator(docker)
+
+    await actuator.provision(rn_id="rn-1", connector_id="cid", name="c1", tokens=_tokens())
+
+    assert docker.containers.run_calls[0]["HostConfig"]["Init"] is True
+
+
 async def test_provision_stamps_default_nofile_ulimit() -> None:
     docker = _FakeDocker()
     actuator = _actuator(docker)

@@ -203,7 +203,9 @@ class DockerActuator:
         known 1-core envelope, plus the connection-capacity tuning that FC's
         scale triggers cannot see: the ``nofile`` ulimit, the
         ``net.ipv4.ip_local_port_range`` sysctl, and ``json-file`` log rotation
-        (so the always-on ANALYTICS stream cannot fill the host disk).
+        (so the always-on ANALYTICS stream cannot fill the host disk). Also runs
+        an init process as PID 1 (``Init``) so orphaned processes are reaped
+        rather than accumulating as zombies.
 
         Args:
             rn_id: Remote Network id (stamped as the remote-network label).
@@ -221,6 +223,14 @@ class DockerActuator:
         """
         host_config: dict[str, Any] = {
             "RestartPolicy": {"Name": "unless-stopped"},
+            # Run an init process (tini) as the container's PID 1. Connector
+            # images typically `exec` the connector binary as PID 1, and that
+            # binary never reaps children it did not spawn. Any process a
+            # container script orphans is reparented to the PID namespace's init
+            # and, with a non-reaping PID 1, becomes a permanent zombie — a slow
+            # leak of host PIDs bounded only by container lifetime. tini reaps
+            # them, and also forwards signals properly on stop.
+            "Init": True,
             "Sysctls": {
                 "net.ipv4.ping_group_range": _PING_GROUP_RANGE,
                 # Widen the outbound source-port pool so a busy connector does not

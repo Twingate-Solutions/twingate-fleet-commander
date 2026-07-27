@@ -182,10 +182,11 @@ class EcsActuator:
         """Register (once) and return the connector task-definition reference.
 
         The task definition carries the image, the prescribed 1 vCPU / 2 GB
-        sizing, the ``nofile`` ulimit, the awslogs configuration (when a log group
-        is set), and a single non-secret ``TWINGATE_NETWORK`` env. Tokens are
-        supplied per-run as a container override, so one revision is reused for
-        every connector.
+        sizing, the ``nofile`` ulimit, ``initProcessEnabled`` (so orphaned
+        processes are reaped rather than accumulating as zombies), the awslogs
+        configuration (when a log group is set), and a single non-secret
+        ``TWINGATE_NETWORK`` env. Tokens are supplied per-run as a container
+        override, so one revision is reused for every connector.
         """
         if self._task_def_arn is not None:
             return self._task_def_arn
@@ -205,6 +206,15 @@ class EcsActuator:
             # ceiling per task is deterministic, not inherited from the platform
             # default. Soft = hard so the connector can use it all.
             "ulimits": [{"name": "nofile", "softLimit": self._nofile, "hardLimit": self._nofile}],
+            # Run an init process as the container's PID 1 (the ECS equivalent of
+            # Docker's ``--init``). Connector images typically ``exec`` the
+            # connector binary as PID 1, and that binary never reaps children it
+            # did not spawn: anything a container script orphans is reparented to
+            # the PID namespace's init and, with a non-reaping PID 1, becomes a
+            # permanent zombie. ``initProcessEnabled`` is one of the few
+            # ``linuxParameters`` fields Fargate supports, so this is safe on
+            # both launch types.
+            "linuxParameters": {"initProcessEnabled": True},
         }
         if self._settings.log_group:
             container_def["logConfiguration"] = {
