@@ -15,6 +15,7 @@ write_files:
   - path: /etc/fc.env
     permissions: '0600'
     content: |
+      # acme (legacy) or acme.us1 (shard-based) — labels before .twingate.com
       TWINGATE_NETWORK=acme
       # TWINGATE_API_KEY is fetched from SSM at runcmd time.
 

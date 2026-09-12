@@ -32,10 +32,12 @@ to re-run.
 git clone <this-repo> fleet-commander
 cd fleet-commander
 
-# Interactive (prompts for network slug + API key):
+# Interactive (prompts for Twingate network + API key):
 ./deploy/bootstrap.sh
 
 # Or non-interactive:
+# TWINGATE_NETWORK = the labels before .twingate.com in your Admin Console URL:
+#   acme (legacy) or acme.us1 (shard-based). Copy the host from the console.
 TWINGATE_NETWORK=acme \
 TWINGATE_API_KEY=tgp_xxxxxxxx \
 ./deploy/bootstrap.sh

@@ -118,7 +118,8 @@ class EcsActuator:
             session: An ``aioboto3.Session`` (duck-typed); ``session.client(...)``
                 must return an async-context-manager client.
             settings: The validated ECS placement settings.
-            network: Twingate network slug, injected as ``TWINGATE_NETWORK``.
+            network: Twingate network — labels before ``.twingate.com``
+                (``acme`` or ``acme.us1``), injected as ``TWINGATE_NETWORK``.
             image: Connector image reference for the task definition.
             labels: The FC identity keys, reused verbatim as ECS tag keys so the
                 fleet is rediscovered the same way it is on Docker.

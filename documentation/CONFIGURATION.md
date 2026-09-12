@@ -17,7 +17,7 @@ Source: `src/fc/config.py:Settings` (pydantic-settings, reads from environment a
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `TWINGATE_NETWORK` | `str` | — **(required)** | Network slug for `https://<slug>.twingate.com`. The GraphQL endpoint is derived from this value. |
+| `TWINGATE_NETWORK` | `str` | — **(required)** | The labels before `.twingate.com` in your Admin Console URL — `acme` (legacy) or `acme.us1` (shard-based, e.g. `us1`). Copy the host from the console rather than assuming a single label. The GraphQL endpoint (`https://<TWINGATE_NETWORK>.twingate.com/api/graphql/`) is derived from this value. |
 | `TWINGATE_API_KEY` | `SecretStr` | — **(required)** | Twingate Admin API key. Requires Admin or DevOps role to create and delete Connectors. Stored as `SecretStr`; never rendered in logs, `repr`, or exceptions. |
 | `FC_CONFIG_PATH` | `str` | `/app/config/config.yaml` | Filesystem path to the YAML policy file. |
 | `FC_STATE_PATH` | `str` | `/app/state/fc.sqlite3` | Filesystem path to the SQLite state database (cooldowns + action history). |

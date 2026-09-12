@@ -267,8 +267,9 @@ class TwingateClient:
         """Construct the client.
 
         Args:
-            network: Twingate network slug; the endpoint becomes
-                ``https://<network>.twingate.com/api/graphql/``.
+            network: The labels before ``.twingate.com`` in the Admin Console
+                URL — ``acme`` (legacy) or ``acme.us1`` (shard-based). The
+                endpoint becomes ``https://<network>.twingate.com/api/graphql/``.
             api_key: Admin/DevOps API key. Accepted as ``str`` or
                 :class:`pydantic.SecretStr` and always stored as ``SecretStr``;
                 its value is only ever sent in the ``X-API-KEY`` header.

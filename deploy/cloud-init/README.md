@@ -20,7 +20,7 @@ over inlining it in user-data, which is often readable from instance metadata.
 
 | Variable | Meaning |
 |---|---|
-| `TWINGATE_NETWORK` | network slug for `https://<slug>.twingate.com` |
+| `TWINGATE_NETWORK` | the labels before `.twingate.com` in your Admin Console URL — `acme` (legacy) or `acme.us1` (shard-based). Copy the host from the console. |
 | `TWINGATE_API_KEY` | Admin/DevOps API key (FC uses it to create/delete connectors) |
 
 FC **self-provisions** its Connectors — there are no seed connectors. Set the

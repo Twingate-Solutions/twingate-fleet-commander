@@ -14,6 +14,7 @@ write_files:
   - path: /etc/fc.env
     permissions: '0600'
     content: |
+      # acme (legacy) or acme.us1 (shard-based) — labels before .twingate.com
       TWINGATE_NETWORK=acme
       # TWINGATE_API_KEY is NOT inlined here — user-data is readable from inside
       # the VM via IMDS. It is fetched from Key Vault at runcmd time (see below).

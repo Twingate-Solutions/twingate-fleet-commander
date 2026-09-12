@@ -96,7 +96,8 @@ class AciActuator:
             token_provider: Async callable returning a bearer token for a scope;
                 called with :data:`ARM_SCOPE`.
             settings: The validated ACI placement settings.
-            network: Twingate network slug, injected as ``TWINGATE_NETWORK``.
+            network: Twingate network — labels before ``.twingate.com``
+                (``acme`` or ``acme.us1``), injected as ``TWINGATE_NETWORK``.
             image: Connector image reference for the container group.
             labels: The FC identity keys, reused verbatim as Azure tag keys.
         """

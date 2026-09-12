@@ -147,8 +147,9 @@ class DockerActuator:
 
         Args:
             docker: The shared aiodocker client.
-            network: Twingate network slug, passed to the connector as
-                ``TWINGATE_NETWORK``.
+            network: Twingate network — the labels before ``.twingate.com`` in
+                the Admin Console URL (``acme`` or ``acme.us1``), passed to the
+                connector as ``TWINGATE_NETWORK``.
             image: Connector image reference used when provisioning.
             labels: The FC Docker label keys (managed/remote-network/
                 connector-id).

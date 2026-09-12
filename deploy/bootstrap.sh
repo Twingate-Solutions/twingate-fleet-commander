@@ -19,7 +19,8 @@
 #   TWINGATE_NETWORK=acme TWINGATE_API_KEY=tgp_... ./deploy/bootstrap.sh
 #
 # Environment overrides (all optional; prompted when needed and a TTY is available):
-#   TWINGATE_NETWORK   network slug for https://<slug>.twingate.com
+#   TWINGATE_NETWORK   labels before .twingate.com in your Admin Console URL:
+#                      acme (legacy) or acme.us1 (shard-based). Copy from the console.
 #   TWINGATE_API_KEY   Admin/DevOps API key (FC uses it to create/delete connectors)
 #   FC_HEALTH_URL      base URL to poll (default http://localhost:8080)
 #   FC_WAIT_TIMEOUT    seconds to wait for health (default 180)
@@ -143,7 +144,7 @@ ensure_files() {
 
 collect_secrets() {
   local network api_key
-  network="$(prompt_if_empty "${TWINGATE_NETWORK:-$(get_env TWINGATE_NETWORK)}" "TWINGATE_NETWORK (network slug)" plain)"
+  network="$(prompt_if_empty "${TWINGATE_NETWORK:-$(get_env TWINGATE_NETWORK)}" "TWINGATE_NETWORK (labels before .twingate.com, e.g. acme or acme.us1)" plain)"
   api_key="$(prompt_if_empty "${TWINGATE_API_KEY:-$(get_env TWINGATE_API_KEY)}" "TWINGATE_API_KEY" secret)"
   [ -n "$network" ] || die "TWINGATE_NETWORK is required"
   [ -n "$api_key" ] || die "TWINGATE_API_KEY is required"

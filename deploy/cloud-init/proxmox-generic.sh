@@ -8,7 +8,7 @@
 # (which installs Docker and brings up the stack). Idempotent — safe to re-run.
 #
 # Provide secrets via the environment (don't hardcode the API key in an image):
-#   TWINGATE_NETWORK=acme \
+#   TWINGATE_NETWORK=acme \      # legacy; use acme.us1 for shard-based tenants
 #   TWINGATE_API_KEY=tgp_xxxxxxxx \
 #   ./proxmox-generic.sh
 #
